@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASTORE ECO - Panel del Repartidor Pro V6</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome para iconos -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Leaflet CSS (Mapa Interactivo) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body class="bg-gray-100 flex justify-center items-center min-h-screen font-sans transition-colors duration-300" id="body-container">
+
+    <!-- Contenedor simulación App Móvil / Panel Repartidor -->
+    <div class="w-full max-w-md bg-white shadow-xl rounded-none sm:rounded-3xl overflow-hidden flex flex-col h-screen sm:h-[880px] relative transition-colors duration-300" id="app-container">
+
+        <!-- TOAST NOTIFICACIÓN FLOTANTE -->
+        <div id="toast" class="absolute bottom-6 left-1/2 transform -translate-x-1/2 bg-gray-900/95 text-white px-4 py-3 rounded-2xl text-xs font-medium shadow-2xl flex items-center gap-2.5 transition-all duration-300 opacity-0 pointer-events-none z-50 backdrop-blur-md border border-gray-700">
+            <i class="fa-solid fa-circle-check text-emerald-400 text-sm"></i>
+            <span id="toast-message">Acción realizada</span>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- MODAL: FOTO DE ENTREGA OBLIGATORIA       -->
+        <!-- ========================================== -->
+        <div id="modal-delivery-photo" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+            <div class="bg-white rounded-3xl overflow-hidden shadow-2xl w-full max-w-xs sm:max-w-sm flex flex-col p-5 relative space-y-4 animate-fade-in text-gray-800">
+                <div class="text-center space-y-1">
+                    <div class="w-12 h-12 bg-emerald-100 text-emerald-700 rounded-2xl flex items-center justify-center mx-auto text-lg shadow-inner">
+                        <i class="fa-solid fa-camera"></i>
+                    </div>
+                    <h3 class="font-bold text-gray-800 text-sm">Foto de Entrega Requerida</h3>
+                    <p class="text-[11px] text-gray-500">Adjunta una foto del paquete entregado en el domicilio o junto al cliente.</p>
+                </div>
+
+                <div class="relative">
+                    <input type="file" id="delivery-photo-input" accept="image/*" capture="environment" class="hidden" onchange="handleDeliveryPhotoPreview(this)">
+                    
+                    <label for="delivery-photo-input" id="delivery-dropzone-label" class="flex flex-col items-center justify-center border-2 border-dashed border-emerald-300 bg-emerald-50/50 hover:bg-emerald-50 rounded-2xl p-4 cursor-pointer transition text-center group shadow-sm">
+                        <div class="w-10 h-10 bg-emerald-100 text-emerald-700 rounded-full flex items-center justify-center text-sm mb-1 group-hover:scale-110 transition shadow-sm">
+                            <i class="fa-solid fa-cloud-arrow-up"></i>
+                        </div>
+                        <span class="text-xs font-bold text-gray-700 group-hover:text-emerald-800">Toca para tomar o subir foto</span>
+                        <span class="text-[10px] text-gray-400 mt-0.5">Usa la cámara de tu celular</span>
+                    </label>
+
+                    <div id="delivery-preview-container" class="hidden bg-white border border-emerald-300 rounded-2xl p-2.5 flex items-center justify-between gap-3 shadow-sm">
+                        <div class="flex items-center gap-2.5 overflow-hidden">
+                            <img id="delivery-thumbnail" src="" class="w-12 h-12 object-cover rounded-xl border border-gray-200 flex-shrink-0">
+                            <div class="overflow-hidden">
+                                <p class="text-xs font-bold text-gray-800 truncate" id="delivery-file-name">entrega.jpg</p>
+                                <p class="text-[10px] text-emerald-600 font-semibold flex items-center gap-1">
+                                    <i class="fa-solid fa-circle-check"></i> Foto lista
+                                </p>
+                            </div>
+                        </div>
+                        <button type="button" onclick="removeDeliveryPhoto()" class="w-8 h-8 bg-red-50 text-red-600 hover:bg-red-100 rounded-lg flex items-center justify-center text-xs transition flex-shrink-0" title="Cambiar foto">
+                            <i class="fa-solid fa-trash-can"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="flex gap-2 pt-1">
+                    <button onclick="closeDeliveryModal()" class="flex-1 bg-gray-100 text-gray-600 py-3 rounded-2xl font-bold text-xs hover:bg-gray-200 transition">Cancelar</button>
+                    <button onclick="confirmDeliveryWithPhoto()" class="flex-1 bg-emerald-700 text-white py-3 rounded-2xl font-bold text-xs shadow-lg hover:bg-emerald-800 transition">Confirmar Entrega</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- MODAL: VER RUTA INTELIGENTE + WAZE / MAPS  -->
+        <!-- ========================================== -->
+        <div id="modal-order-route" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+            <div class="bg-white rounded-3xl overflow-hidden shadow-2xl w-full max-w-sm flex flex-col p-5 relative space-y-3 animate-fade-in text-gray-800">
+                <div class="flex items-center justify-between pb-2 border-b border-gray-100">
+                    <div class="flex items-center gap-2">
+                        <div class="w-8 h-8 bg-blue-100 text-blue-700 rounded-xl flex items-center justify-center text-xs shadow-inner">
+                            <i class="fa-solid fa-route"></i>
+                        </div>
+                        <div>
+                            <h3 class="font-bold text-gray-800 text-xs" id="route-modal-title">Ruta Inteligente</h3>
+                            <p class="text-[10px] text-gray-500">Selección de vías óptimas en Pucallpa</p>
+                        </div>
+                    </div>
+                    <button onclick="closeRouteModal()" class="w-7 h-7 bg-gray-100 text-gray-500 hover:bg-gray-200 rounded-full flex items-center justify-center transition">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+
+                <!-- CONTENEDOR DEL MAPA INTERACTIVO -->
+                <div id="route-map" class="w-full h-36 rounded-2xl border border-gray-200 shadow-sm z-0"></div>
+
+                <!-- SELECTOR DE RUTAS INTELIGENTES -->
+                <div class="grid grid-cols-2 gap-2 text-xs">
+                    <button onclick="selectRouteMode('fast')" id="btn-route-fast" class="p-2 rounded-xl border border-emerald-500 bg-emerald-50 text-emerald-900 font-bold flex flex-col items-center justify-center transition shadow-sm">
+                        <span class="text-[9px] uppercase text-emerald-700"><i class="fa-solid fa-bolt"></i> Vía Rápida</span>
+                        <span id="route-fast-time" class="text-xs font-black">~8 min</span>
+                    </button>
+                    <button onclick="selectRouteMode('alt')" id="btn-route-alt" class="p-2 rounded-xl border border-gray-200 bg-gray-50 text-gray-600 font-bold flex flex-col items-center justify-center transition shadow-sm hover:bg-gray-100">
+                        <span class="text-[9px] uppercase text-gray-500"><i class="fa-solid fa-road"></i> Ruta Alternativa</span>
+                        <span id="route-alt-time" class="text-xs font-black">~12 min</span>
+                    </button>
+                </div>
+
+                <div class="bg-blue-50/70 border border-blue-200 rounded-xl p-2 text-[11px] text-blue-900 flex items-start gap-2">
+                    <i class="fa-solid fa-circle-info text-blue-600 mt-0.5"></i>
+                    <span id="route-instruction">Recomendado: Tomar Av. Principal hacia el sector del cliente para un tiempo récord.</span>
+                </div>
+
+                <!-- BOTONES DE NAVEGACIÓN DUAL (MAPS & WAZE) -->
+                <div class="grid grid-cols-2 gap-2 pt-1">
+                    <a id="route-waze-btn" href="#" target="_blank" class="bg-cyan-600 text-white py-2.5 rounded-xl font-bold text-xs shadow-md hover:bg-cyan-700 transition flex items-center justify-center gap-1.5 text-center">
+                        <i class="fa-brands fa-waze"></i>
+                        <span>Abrir Waze</span>
+                    </a>
+                    <a id="route-maps-btn" href="#" target="_blank" class="bg-blue-600 text-white py-2.5 rounded-xl font-bold text-xs shadow-md hover:bg-blue-700 transition flex items-center justify-center gap-1.5 text-center">
+                        <i class="fa-solid fa-map-location-dot"></i>
+                        <span>Google Maps</span>
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- MODAL: REPORTE DE INCIDENCIAS              -->
+        <!-- ========================================== -->
+        <div id="modal-incident" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+            <div class="bg-white rounded-3xl overflow-hidden shadow-2xl w-full max-w-xs sm:max-w-sm flex flex-col p-5 relative space-y-4 animate-fade-in text-gray-800">
+                <div class="flex items-center justify-between pb-2 border-b border-gray-100">
+                    <div class="flex items-center gap-2">
+                        <div class="w-9 h-9 bg-red-100 text-red-700 rounded-2xl flex items-center justify-center text-sm shadow-inner">
+                            <i class="fa-solid fa-triangle-exclamation"></i>
+                        </div>
+                        <div>
+                            <h3 class="font-bold text-gray-800 text-sm">Reportar Incidencia</h3>
+                            <p class="text-[10px] text-gray-500" id="incident-order-label">Pedido #000</p>
+                        </div>
+                    </div>
+                    <button onclick="closeIncidentModal()" class="w-8 h-8 bg-gray-100 text-gray-500 hover:bg-gray-200 rounded-full flex items-center justify-center transition">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+
+                <div class="space-y-3 text-xs">
+                    <div class="space-y-1">
+                        <label class="font-bold text-gray-700 block">Selecciona el problema:</label>
+                        <select id="incident-type" class="w-full bg-gray-50 border border-gray-200 rounded-xl p-2.5 text-xs font-semibold text-gray-800 focus:outline-none focus:border-red-500">
+                            <option value="Cliente ausente en domicilio">Cliente ausente en domicilio</option>
+                            <option value="Dirección incorrecta o no existe">Dirección incorrecta o no existe</option>
+                            <option value="Problema mecánico con vehículo">Problema mecánico con vehículo</option>
+                            <option value="Cliente rechaza el pedido">Cliente rechaza el pedido</option>
+                            <option value="Otro motivo operativo">Otro motivo operativo</option>
+                        </select>
+                    </div>
+
+                    <div class="space-y-1">
+                        <label class="font-bold text-gray-700 block">Comentarios adicionales:</label>
+                        <textarea id="incident-notes" rows="3" placeholder="Describe brevemente la situación..." class="w-full bg-gray-50 border border-gray-200 rounded-xl p-2.5 text-xs text-gray-800 focus:outline-none focus:border-red-500 resize-none"></textarea>
+                    </div>
+                </div>
+
+                <div class="flex gap-2 pt-1">
+                    <button onclick="closeIncidentModal()" class="flex-1 bg-gray-100 text-gray-600 py-3 rounded-2xl font-bold text-xs hover:bg-gray-200 transition">Cancelar</button>
+                    <button onclick="submitIncident()" class="flex-1 bg-red-600 text-white py-3 rounded-2xl font-bold text-xs shadow-lg hover:bg-red-700 transition">Enviar Reporte</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- MODAL: HISTORIAL Y DESGLOSE DE GANANCIAS   -->
+        <!-- ========================================== -->
+        <div id="modal-earnings" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+            <div class="bg-white rounded-3xl overflow-hidden shadow-2xl w-full max-w-xs sm:max-w-sm flex flex-col p-5 relative space-y-4 animate-fade-in text-gray-800">
+                <div class="flex items-center justify-between pb-2 border-b border-gray-100">
+                    <div class="flex items-center gap-2">
+                        <div class="w-9 h-9 bg-amber-100 text-amber-700 rounded-2xl flex items-center justify-center text-sm shadow-inner">
+                            <i class="fa-solid fa-wallet"></i>
+                        </div>
+                        <div>
+                            <h3 class="font-bold text-gray-800 text-sm">Desglose de Ganancias</h3>
+                            <p class="text-[10px] text-gray-500">Comisiones y tarifas de entrega</p>
+                        </div>
+                    </div>
+                    <button onclick="closeEarningsModal()" class="w-8 h-8 bg-gray-100 text-gray-500 hover:bg-gray-200 rounded-full flex items-center justify-center transition">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+
+                <div class="space-y-3 text-xs">
+                    <div class="bg-amber-50 border border-amber-200 rounded-2xl p-3 text-center space-y-1">
+                        <span class="text-[10px] text-amber-700 uppercase font-bold block">Total Acumulado Hoy</span>
+                        <h2 id="earnings-modal-total" class="text-2xl font-black text-amber-900">S/ 0.00</h2>
+                        <span class="text-[10px] text-amber-600 font-medium block" id="earnings-modal-count">0 entregas completadas</span>
+                    </div>
+
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-center bg-gray-50 p-2.5 rounded-xl border border-gray-100">
+                            <span class="text-gray-600 font-medium">Tarifa base por entrega:</span>
+                            <strong class="text-gray-800">S/ 5.00</strong>
+                        </div>
+                        <div class="flex justify-between items-center bg-gray-50 p-2.5 rounded-xl border border-gray-100">
+                            <span class="text-gray-600 font-medium">Propinas / Bonos extras:</span>
+                            <strong class="text-emerald-700">S/ 0.00</strong>
+                        </div>
+                        <div class="flex justify-between items-center bg-gray-50 p-2.5 rounded-xl border border-gray-100">
+                            <span class="text-gray-600 font-medium">Estado de pago:</span>
+                            <span class="bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full text-[10px]">Al día / Pendiente de cierre</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button onclick="closeEarningsModal()" class="w-full bg-slate-900 text-white py-3 rounded-2xl font-bold text-xs shadow-lg hover:bg-slate-800 transition">Entendido</button>
+            </div>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- VISTA 1: LOGIN DE REPARTIDOR -->
+        <!-- ========================================== -->
+        <div id="driver-login-view" class="flex flex-col h-full justify-between p-6 bg-gradient-to-b from-slate-900 to-slate-950 text-white">
+            <div class="pt-10 text-center space-y-2">
+                <div class="w-14 h-14 bg-emerald-600 rounded-2xl flex items-center justify-center text-white text-xl font-bold shadow-lg mx-auto">
+                    <i class="fa-solid fa-motorcycle"></i>
+                </div>
+                <h1 class="font-black text-xl tracking-wider">ASTORE<span class="text-emerald-400 font-light">ECO</span></h1>
+                <p class="text-xs text-slate-300">Panel exclusivo para Repartidores Autorizados</p>
+            </div>
+
+            <div class="bg-white text-gray-800 rounded-3xl p-5 shadow-2xl space-y-3">
+                <h2 class="font-bold text-sm text-gray-800 text-center">Acceso Motorizado</h2>
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold text-gray-500 uppercase">Número de Celular</label>
+                    <div class="flex items-center bg-gray-50 border border-gray-200 rounded-2xl px-3 py-2.5">
+                        <span class="text-xs font-bold text-gray-500 mr-2">+51</span>
+                        <input type="tel" id="driver-login-phone" placeholder="999999999" maxlength="9" class="w-full bg-transparent text-sm focus:outline-none font-semibold text-gray-800">
+                    </div>
+                </div>
+                <div class="space-y-1">
+                    <label class="text-[10px] font-bold text-gray-500 uppercase">PIN de Acceso (6 dígitos)</label>
+                    <div class="flex items-center bg-gray-50 border border-gray-200 rounded-2xl px-3 py-2.5">
+                        <i class="fa-solid fa-lock text-gray-400 mr-3 text-sm"></i>
+                        <input type="password" id="driver-login-pin" placeholder="••••••" maxlength="6" class="w-full bg-transparent text-sm focus:outline-none font-semibold tracking-widest text-gray-800">
+                    </div>
+                </div>
+                <button onclick="handleDriverLogin()" class="w-full bg-slate-900 text-white py-3 rounded-2xl font-bold text-sm shadow-lg hover:bg-slate-800 transition flex items-center justify-center gap-2 mt-2">
+                    <span>Ingresar al Panel</span>
+                    <i class="fa-solid fa-arrow-right text-xs"></i>
+                </button>
+            </div>
+
+            <div class="text-center pb-2">
+                <a href="panel admin.html" class="text-[11px] text-slate-400 hover:text-white underline">Ir al Panel de Administración</a>
+            </div>
+        </div>
+
+        <!-- ========================================== -->
+        <!-- VISTA 2: DASHBOARD DEL REPARTIDOR PRO      -->
+        <!-- ========================================== -->
+        <div id="driver-dashboard-view" class="hidden flex flex-col h-full bg-gray-50 transition-colors duration-300">
+            <!-- HEADER REPARTIDOR -->
+            <div class="bg-slate-900 text-white p-4 pt-6 flex items-center justify-between shadow-md z-10">
+                <div class="flex items-center gap-3">
+                    <div class="w-9 h-9 bg-emerald-600 rounded-full flex items-center justify-center text-white font-bold shadow-sm relative">
+                        <i class="fa-solid fa-motorcycle text-sm"></i>
+                        <span id="new-order-badge" class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-slate-900 hidden animate-ping"></span>
+                    </div>
+                    <div>
+                        <h1 id="driver-header-name" class="font-bold text-sm">Repartidor</h1>
+                        <p id="driver-header-vehicle" class="text-[10px] text-emerald-400 font-medium">Vehículo</p>
+                    </div>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button onclick="toggleDarkMode()" class="text-xs bg-slate-800 text-amber-300 p-2 rounded-xl font-bold hover:bg-slate-700 transition" title="Cambiar Tema (Claro/Oscuro)">
+                        <i class="fa-solid fa-moon" id="dark-mode-icon"></i>
+                    </button>
+                    <button onclick="renderDriverOrders()" class="text-xs bg-slate-800 text-emerald-300 p-2 rounded-xl font-bold hover:bg-slate-700 transition" title="Actualizar">
+                        <i class="fa-solid fa-rotate-right"></i>
+                    </button>
+                    <button onclick="driverLogout()" class="text-xs bg-red-900/60 text-red-200 p-2 rounded-xl font-bold hover:bg-red-900 transition" title="Cerrar Sesión">
+                        <i class="fa-solid fa-right-from-bracket"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- CONTENIDO PRINCIPAL -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-3 pb-24 bg-gray-50 transition-colors duration-300" id="dashboard-content-area">
+                
+                <!-- ESTADÍSTICAS Y GANANCIAS DEL DÍA (CLICKEABLE) -->
+                <div class="grid grid-cols-2 gap-3 cursor-pointer" onclick="openEarningsModal()" title="Ver desglose de ganancias">
+                    <div class="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 shadow-sm text-center hover:bg-emerald-100 transition">
+                        <span class="text-[10px] text-emerald-700 uppercase font-bold block">Entregas Hoy</span>
+                        <h3 id="stat-completed" class="text-lg font-black text-emerald-900">0</h3>
+                    </div>
+                    <div class="bg-amber-50 border border-amber-200 rounded-2xl p-3 shadow-sm text-center hover:bg-amber-100 transition">
+                        <span class="text-[10px] text-amber-700 uppercase font-bold block">Comisión Estimada</span>
+                        <h3 id="stat-earnings" class="text-lg font-black text-amber-900">S/ 0.00</h3>
+                    </div>
+                </div>
+
+                <!-- INDICADOR DE GPS EN VIVO Y ESTADO DE RED -->
+                <div class="space-y-1.5">
+                    <div id="gps-status-banner" class="bg-blue-900 text-blue-200 px-3 py-2 rounded-xl text-[11px] font-semibold flex items-center justify-between border border-blue-700 shadow-sm">
+                        <span class="flex items-center gap-2"><i class="fa-solid fa-location-arrow animate-spin"></i> GPS en vivo activo (Transmitiendo)</span>
+                        <span id="gps-coords-text" class="text-[10px] bg-blue-950 px-2 py-0.5 rounded-lg text-blue-300">Buscando...</span>
+                    </div>
+                    <div id="offline-banner" class="hidden bg-slate-800 text-amber-300 px-3 py-2 rounded-xl text-[11px] font-semibold flex items-center justify-between border border-slate-700 shadow-sm">
+                        <span class="flex items-center gap-2"><i class="fa-solid fa-triangle-exclamation"></i> Sin conexión (Modo Offline Activo)</span>
+                        <span class="text-[10px] bg-slate-900 px-2 py-0.5 rounded-lg text-white">Caché local</span>
+                    </div>
+                </div>
+
+                <!-- FILTROS DE ESTADO -->
+                <div class="flex gap-1.5 overflow-x-auto pb-1 text-xs">
+                    <button onclick="setDriverFilter('all')" id="filter-all" class="px-3 py-1.5 rounded-xl font-bold bg-slate-900 text-white transition flex-shrink-0">Todos</button>
+                    <button onclick="setDriverFilter('pendiente')" id="filter-pendiente" class="px-3 py-1.5 rounded-xl font-bold bg-white text-gray-600 border border-gray-200 transition flex-shrink-0">Pendientes</button>
+                    <button onclick="setDriverFilter('ruta')" id="filter-ruta" class="px-3 py-1.5 rounded-xl font-bold bg-white text-gray-600 border border-gray-200 transition flex-shrink-0">En Ruta</button>
+                    <button onclick="setDriverFilter('entregado')" id="filter-entregado" class="px-3 py-1.5 rounded-xl font-bold bg-white text-gray-600 border border-gray-200 transition flex-shrink-0">Entregados</button>
+                </div>
+
+                <div id="driver-orders-container" class="space-y-3">
+                    <!-- Se inyecta dinámicamente -->
+                </div>
+            </div>
+
+            <!-- FOOTER / NAVEGACIÓN RÁPIDA -->
+            <div class="absolute bottom-0 left-0 right-0 bg-white border-t border-gray-200 p-4 shadow-2xl transition-colors duration-300" id="dashboard-footer">
+                <a href="index.html" class="w-full bg-slate-900 text-white py-3 rounded-2xl font-bold text-sm shadow-lg hover:bg-slate-800 transition flex items-center justify-center gap-2">
+                    <span>Ir a la Tienda Principal (Cliente)</span>
+                    <i class="fa-solid fa-store text-xs"></i>
+                </a>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Script completo con Rutas Inteligentes, Waze, Maps, GPS en Vivo, Mapa Leaflet, Sincronización y Dark Mode -->
+    <script>
+        let currentDriver = null;
+        let currentFilter = 'all';
+        let pendingDeliveryOrderId = null;
+        let deliveryPhotoBase64 = null;
+        let activeIncidentOrderId = null;
+        let lastOrdersCount = 0;
+        let isDarkMode = false;
+        let routeMap = null;
+        let watchId = null;
+        let currentOrderDest = { lat: -8.3850, lng: -74.5600 };
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedDriver = localStorage.getItem('astoreeco_current_driver');
+            if (savedDriver) {
+                try {
+                    currentDriver = JSON.parse(savedDriver);
+                    showDashboard();
+                } catch(e) {
+                    localStorage.removeItem('astoreeco_current_driver');
+                }
+            }
+
+            // Detector de estado de conexión (Offline Mode)
+            window.addEventListener('online', updateOnlineStatus);
+            window.addEventListener('offline', updateOnlineStatus);
+            updateOnlineStatus();
+
+            // Verificador periódico de nuevos pedidos y Heartbeat de Actividad
+            setInterval(checkForNewOrders, 5000);
+            setInterval(updateDriverHeartbeat, 30000);
+        });
+
+        function updateOnlineStatus() {
+            const banner = document.getElementById('offline-banner');
+            if (!navigator.onLine) {
+                if (banner) banner.classList.remove('hidden');
+                showToast('⚠️ Conexión perdida. Usando modo offline.');
+            } else {
+                if (banner) banner.classList.add('hidden');
+            }
+        }
+
+        function startLiveGPS() {
+            if ("geolocation" in navigator) {
+                watchId = navigator.geolocation.watchPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        
+                        document.getElementById('gps-coords-text').textContent = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+
+                        if (currentDriver) {
+                            currentDriver.currentLocation = { lat, lng, timestamp: Date.now() };
+                            currentDriver.lastActive = Date.now();
+                            localStorage.setItem('astoreeco_current_driver', JSON.stringify(currentDriver));
+
+                            let allDrivers = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+                            let index = allDrivers.findIndex(d => d.phone === currentDriver.phone);
+                            if (index !== -1) {
+                                allDrivers[index].currentLocation = currentDriver.currentLocation;
+                                allDrivers[index].lastActive = currentDriver.lastActive;
+                                localStorage.setItem('astoreeco_drivers', JSON.stringify(allDrivers));
+                            }
+                        }
+                    },
+                    (error) => {
+                        console.warn("Error GPS: ", error.message);
+                        document.getElementById('gps-coords-text').textContent = "GPS inactivo";
+                    },
+                    { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
+                );
+            } else {
+                document.getElementById('gps-status-banner').classList.add('hidden');
+            }
+        }
+
+        function stopLiveGPS() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+        }
+
+        function updateDriverHeartbeat() {
+            if (currentDriver) {
+                try {
+                    currentDriver.lastActive = Date.now();
+                    localStorage.setItem('astoreeco_current_driver', JSON.stringify(currentDriver));
+                    
+                    let allDrivers = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+                    let index = allDrivers.findIndex(d => d.phone === currentDriver.phone);
+                    if (index !== -1) {
+                        allDrivers[index].lastActive = currentDriver.lastActive;
+                        localStorage.setItem('astoreeco_drivers', JSON.stringify(allDrivers));
+                    }
+                } catch(e) {}
+            }
+        }
+
+        function checkForNewOrders() {
+            const allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            if (lastOrdersCount > 0 && allOrders.length > lastOrdersCount) {
+                showToast('🔔 ¡Nuevo pedido asignado al sistema!');
+                playBeepAlert();
+                const badge = document.getElementById('new-order-badge');
+                if (badge) badge.classList.remove('hidden');
+                if (currentDriver) renderDriverOrders();
+            }
+            lastOrdersCount = allOrders.length;
+        }
+
+        function playBeepAlert() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = 800;
+                gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.3);
+            } catch(e) {}
+        }
+
+        function toggleDarkMode() {
+            isDarkMode = !isDarkMode;
+            const container = document.getElementById('app-container');
+            const contentArea = document.getElementById('dashboard-content-area');
+            const footer = document.getElementById('dashboard-footer');
+            const icon = document.getElementById('dark-mode-icon');
+
+            if (isDarkMode) {
+                container.classList.add('bg-slate-900', 'text-white');
+                contentArea.classList.remove('bg-gray-50');
+                contentArea.classList.add('bg-slate-950', 'text-white');
+                footer.classList.remove('bg-white', 'border-gray-200');
+                footer.classList.add('bg-slate-900', 'border-slate-800');
+                icon.className = "fa-solid fa-sun";
+                showToast('🌙 Modo oscuro activado');
+            } else {
+                container.classList.remove('bg-slate-900', 'text-white');
+                contentArea.classList.remove('bg-slate-950', 'text-white');
+                contentArea.classList.add('bg-gray-50');
+                footer.classList.remove('bg-slate-900', 'border-slate-800');
+                footer.classList.add('bg-white', 'border-gray-200');
+                icon.className = "fa-solid fa-moon";
+                showToast('☀️ Modo claro activado');
+            }
+            renderDriverOrders();
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            document.getElementById('toast-message').textContent = message;
+            toast.classList.remove('opacity-0', 'pointer-events-none');
+            toast.classList.add('opacity-100', 'translate-y-0');
+            setTimeout(() => {
+                toast.classList.remove('opacity-100', 'translate-y-0');
+                toast.classList.add('opacity-0', 'pointer-events-none');
+            }, 2500);
+        }
+
+        function handleDriverLogin() {
+            const phone = document.getElementById('driver-login-phone').value.trim();
+            const pin = document.getElementById('driver-login-pin').value.trim();
+
+            if (!phone || !pin) {
+                showToast('Por favor ingresa tu celular y PIN.');
+                return;
+            }
+
+            const drivers = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+            
+            if (drivers.length === 0) {
+                showToast('No hay repartidores registrados en el Panel Admin.');
+                return;
+            }
+
+            const found = drivers.find(d => d.phone === phone && d.pin === pin);
+
+            if (found) {
+                currentDriver = found;
+                currentDriver.lastActive = Date.now();
+                localStorage.setItem('astoreeco_current_driver', JSON.stringify(currentDriver));
+                showDashboard();
+                showToast(`¡Bienvenido, ${currentDriver.name}!`);
+            } else {
+                showToast('Credenciales incorrectas o repartidor no registrado.');
+            }
+        }
+
+        function showDashboard() {
+            document.getElementById('driver-login-view').classList.add('hidden');
+            document.getElementById('driver-dashboard-view').classList.remove('hidden');
+            
+            document.getElementById('driver-header-name').textContent = currentDriver.name;
+            document.getElementById('driver-header-vehicle').textContent = `${currentDriver.vehicle} ${currentDriver.plate ? '(' + currentDriver.plate + ')' : ''}`;
+            
+            startLiveGPS();
+            renderDriverOrders();
+        }
+
+        function driverLogout() {
+            stopLiveGPS();
+            currentDriver = null;
+            localStorage.removeItem('astoreeco_current_driver');
+            document.getElementById('driver-dashboard-view').classList.add('hidden');
+            document.getElementById('driver-login-view').classList.remove('hidden');
+            showToast('Sesión cerrada correctamente.');
+        }
+
+        function setDriverFilter(filter) {
+            currentFilter = filter;
+            ['all', 'pendiente', 'ruta', 'entregado'].forEach(f => {
+                const btn = document.getElementById(`filter-${f}`);
+                if (f === filter) {
+                    btn.className = "px-3 py-1.5 rounded-xl font-bold bg-slate-900 text-white transition flex-shrink-0";
+                } else {
+                    btn.className = "px-3 py-1.5 rounded-xl font-bold bg-white text-gray-600 border border-gray-200 transition flex-shrink-0";
+                }
+            });
+            renderDriverOrders();
+        }
+
+        function openRouteModal(orderId) {
+            const allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const order = allOrders.find(o => o.id === orderId);
+            if (!order) {
+                showToast('Pedido no encontrado.');
+                return;
+            }
+
+            const deliv = order.deliveryDetails || {};
+            document.getElementById('route-modal-title').textContent = `Ruta del Pedido ${order.id}`;
+            
+            let originLat = currentDriver && currentDriver.currentLocation ? currentDriver.currentLocation.lat : -8.3791;
+            let originLng = currentDriver && currentDriver.currentLocation ? currentDriver.currentLocation.lng : -74.5539;
+            currentOrderDest.lat = deliv.coordinates ? deliv.coordinates.lat : -8.3850;
+            currentOrderDest.lng = deliv.coordinates ? deliv.coordinates.lng : -74.5600;
+
+            const dist = Math.sqrt(Math.pow(currentOrderDest.lat - originLat, 2) + Math.pow(currentOrderDest.lng - originLng, 2)) * 111;
+            const finalDist = Math.max(1.2, dist.toFixed(1));
+            
+            document.getElementById('route-fast-time').textContent = `~${Math.round(finalDist * 3 + 3)} min`;
+            document.getElementById('route-alt-time').textContent = `~${Math.round(finalDist * 4.5 + 5)} min`;
+
+            // Configurar por defecto ruta rápida
+            selectRouteMode('fast');
+            document.getElementById('modal-order-route').classList.remove('hidden');
+
+            // Renderizar Mapa Leaflet
+            setTimeout(() => {
+                if (!routeMap) {
+                    routeMap = L.map('route-map').setView([originLat, originLng], 14);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '&copy; OpenStreetMap'
+                    }).addTo(routeMap);
+                } else {
+                    routeMap.invalidateSize();
+                }
+
+                routeMap.eachLayer((layer) => {
+                    if (layer instanceof L.Marker || layer instanceof L.Polyline) {
+                        routeMap.removeLayer(layer);
+                    }
+                });
+
+                L.marker([originLat, originLng]).addTo(routeMap)
+                    .bindPopup('<b>Mi Ubicación Actual (GPS)</b>').openPopup();
+
+                L.marker([currentOrderDest.lat, currentOrderDest.lng]).addTo(routeMap)
+                    .bindPopup(`<b>Destino:</b> ${order.clientName || 'Cliente'}`);
+
+                const polyline = L.polyline([[originLat, originLng], [currentOrderDest.lat, currentOrderDest.lng]], {color: '#10b981', weight: 4, dashArray: '5, 5'}).addTo(routeMap);
+                routeMap.fitBounds(polyline.getBounds(), {padding: [30, 30]});
+            }, 250);
+        }
+
+        function selectRouteMode(mode) {
+            let originLat = currentDriver && currentDriver.currentLocation ? currentDriver.currentLocation.lat : -8.3791;
+            let originLng = currentDriver && currentDriver.currentLocation ? currentDriver.currentLocation.lng : -74.5539;
+            
+            const btnFast = document.getElementById('btn-route-fast');
+            const btnAlt = document.getElementById('btn-route-alt');
+            const instruction = document.getElementById('route-instruction');
+            const mapsBtn = document.getElementById('route-maps-btn');
+            const wazeBtn = document.getElementById('route-waze-btn');
+
+            let mapsUrl = '';
+            let wazeUrl = `https://waze.com/ul?ll=${currentOrderDest.lat},${currentOrderDest.lng}&navigate=yes`;
+
+            if (mode === 'fast') {
+                btnFast.className = "p-2 rounded-xl border border-emerald-500 bg-emerald-50 text-emerald-900 font-bold flex flex-col items-center justify-center transition shadow-sm";
+                btnAlt.className = "p-2 rounded-xl border border-gray-200 bg-gray-50 text-gray-600 font-bold flex flex-col items-center justify-center transition shadow-sm hover:bg-gray-100";
+                instruction.textContent = "Recomendado: Vía rápida por avenida principal. Menor tiempo estimado.";
+                mapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${originLat},${originLng}&destination=${currentOrderDest.lat},${currentOrderDest.lng}&travelmode=driving`;
+            } else {
+                btnAlt.className = "p-2 rounded-xl border border-blue-500 bg-blue-50 text-blue-900 font-bold flex flex-col items-center justify-center transition shadow-sm";
+                btnFast.className = "p-2 rounded-xl border border-gray-200 bg-gray-50 text-gray-600 font-bold flex flex-col items-center justify-center transition shadow-sm hover:bg-gray-100";
+                instruction.textContent = "Ruta alternativa: Evita posibles zonas de tráfico pesado o desvíos locales.";
+                mapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${originLat},${originLng}&destination=${currentOrderDest.lat},${currentOrderDest.lng}&travelmode=driving&avoid=tolls`;
+            }
+
+            mapsBtn.href = mapsUrl;
+            wazeBtn.href = wazeUrl;
+        }
+
+        function closeRouteModal() {
+            document.getElementById('modal-order-route').classList.add('hidden');
+        }
+
+        function openIncidentModal(orderId) {
+            activeIncidentOrderId = orderId;
+            document.getElementById('incident-order-label').textContent = `Pedido ${orderId}`;
+            document.getElementById('incident-notes').value = '';
+            document.getElementById('modal-incident').classList.remove('hidden');
+        }
+
+        function closeIncidentModal() {
+            document.getElementById('modal-incident').classList.add('hidden');
+            activeIncidentOrderId = null;
+        }
+
+        function submitIncident() {
+            const type = document.getElementById('incident-type').value;
+            const notes = document.getElementById('incident-notes').value.trim();
+
+            let allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const index = allOrders.findIndex(o => o.id === activeIncidentOrderId);
+            if (index !== -1) {
+                allOrders[index].status = `Incidencia: ${type}`;
+                allOrders[index].incidentDetails = { type, notes, date: new Date().toLocaleTimeString() };
+                localStorage.setItem('astoreeco_orders', JSON.stringify(allOrders));
+                showToast(`⚠️ Incidencia reportada en pedido ${activeIncidentOrderId}`);
+                closeIncidentModal();
+                renderDriverOrders();
+            }
+        }
+
+        function openEarningsModal() {
+            const allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const completedCount = allOrders.filter(o => o.status && o.status.includes('Entregado')).length;
+            const total = completedCount * 5.00;
+
+            document.getElementById('earnings-modal-total').textContent = `S/ ${total.toFixed(2)}`;
+            document.getElementById('earnings-modal-count').textContent = `${completedCount} entregas completadas hoy`;
+            document.getElementById('modal-earnings').classList.remove('hidden');
+        }
+
+        function closeEarningsModal() {
+            document.getElementById('modal-earnings').classList.add('hidden');
+        }
+
+        function promptDeliveryPhoto(orderId) {
+            pendingDeliveryOrderId = orderId;
+            deliveryPhotoBase64 = null;
+            removeDeliveryPhoto();
+            document.getElementById('modal-delivery-photo').classList.remove('hidden');
+        }
+
+        function closeDeliveryModal() {
+            document.getElementById('modal-delivery-photo').classList.add('hidden');
+            pendingDeliveryOrderId = null;
+        }
+
+        function handleDeliveryPhotoPreview(input) {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    deliveryPhotoBase64 = e.target.result;
+                    document.getElementById('delivery-thumbnail').src = deliveryPhotoBase64;
+                    document.getElementById('delivery-file-name').textContent = file.name;
+                    document.getElementById('delivery-dropzone-label').classList.add('hidden');
+                    document.getElementById('delivery-preview-container').classList.remove('hidden');
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function removeDeliveryPhoto() {
+            const input = document.getElementById('delivery-photo-input');
+            input.value = '';
+            deliveryPhotoBase64 = null;
+            document.getElementById('delivery-dropzone-label').classList.remove('hidden');
+            document.getElementById('delivery-preview-container').classList.add('hidden');
+        }
+
+        function confirmDeliveryWithPhoto() {
+            if (!deliveryPhotoBase64) {
+                showToast('⚠️ Debes adjuntar la foto de entrega.');
+                return;
+            }
+
+            let allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const index = allOrders.findIndex(o => o.id === pendingDeliveryOrderId);
+            if (index !== -1) {
+                allOrders[index].status = 'Entregado en tu Mesa';
+                allOrders[index].deliveryPhoto = deliveryPhotoBase64;
+                localStorage.setItem('astoreeco_orders', JSON.stringify(allOrders));
+                showToast(`¡Pedido ${pendingDeliveryOrderId} entregado con éxito!`);
+                closeDeliveryModal();
+                const badge = document.getElementById('new-order-badge');
+                if (badge) badge.classList.add('hidden');
+                renderDriverOrders();
+            }
+        }
+
+        function updateOrderStatus(orderId, newStatus) {
+            let allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const index = allOrders.findIndex(o => o.id === orderId);
+            if (index !== -1) {
+                allOrders[index].status = newStatus;
+                localStorage.setItem('astoreeco_orders', JSON.stringify(allOrders));
+                showToast(`Pedido ${orderId} actualizado a: ${newStatus}`);
+                renderDriverOrders();
+            }
+        }
+
+        function renderDriverOrders() {
+            const container = document.getElementById('driver-orders-container');
+            const allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+
+            const completedCount = allOrders.filter(o => o.status && o.status.includes('Entregado')).length;
+            document.getElementById('stat-completed').textContent = completedCount;
+            document.getElementById('stat-earnings').textContent = `S/ ${(completedCount * 5.00).toFixed(2)}`;
+
+            if (allOrders.length === 0) {
+                container.innerHTML = `<p class="text-xs text-gray-400 text-center py-12 bg-white rounded-2xl border border-gray-100 shadow-sm">No hay pedidos registrados en el sistema actualmente.</p>`;
+                return;
+            }
+
+            const filteredOrders = allOrders.filter(order => {
+                const status = (order.status || '').toLowerCase();
+                if (currentFilter === 'pendiente') return status.includes('cosecha') || status.includes('pendiente');
+                if (currentFilter === 'ruta') return status.includes('ruta');
+                if (currentFilter === 'entregado') return status.includes('entregado');
+                return true;
+            });
+
+            if (filteredOrders.length === 0) {
+                container.innerHTML = `<p class="text-xs text-gray-400 text-center py-8 bg-white rounded-2xl border border-gray-100 shadow-sm">No hay pedidos en esta categoría.</p>`;
+                return;
+            }
+
+            container.innerHTML = filteredOrders.map(order => {
+                const deliv = order.deliveryDetails || {};
+                const coords = deliv.coordinates ? `Lat: ${deliv.coordinates.lat.toFixed(4)}, Lng: ${deliv.coordinates.lng.toFixed(4)}` : 'Ubicación estándar (Pucallpa)';
+                const phoneClean = order.clientPhone ? order.clientPhone.replace(/\D/g, '') : '';
+                const whatsappLink = phoneClean ? `https://wa.me/51${phoneClean}?text=Hola,%20te%20escribo%20del%20delivery%20de%20ASTORE%20ECO%20respecto%20a%20tu%20pedido%20${order.id}` : '#';
+
+                let badgeColor = "bg-amber-100 text-amber-800";
+                if(order.status && order.status.includes('ruta')) badgeColor = "bg-blue-100 text-blue-800";
+                if(order.status && order.status.includes('Entregado')) badgeColor = "bg-emerald-100 text-emerald-800";
+                if(order.status && order.status.includes('Incidencia')) badgeColor = "bg-red-100 text-red-800";
+
+                const cardBg = isDarkMode ? "bg-slate-900 border-slate-800 text-slate-100" : "bg-white border-gray-200 text-gray-800";
+                const innerBoxBg = isDarkMode ? "bg-slate-800/80 border-slate-700" : "bg-emerald-50/70 border-emerald-200";
+
+                return `
+                    <div class="${cardBg} border rounded-2xl p-4 shadow-sm space-y-3 transition-colors">
+                        <div class="flex justify-between items-center pb-2 border-b border-gray-100/20">
+                            <div>
+                                <span class="font-extrabold text-xs text-emerald-400">${order.id}</span>
+                                <span class="text-[10px] text-gray-400 block">${order.date || 'Reciente'}</span>
+                            </div>
+                            <span class="text-[10px] ${badgeColor} font-bold px-2.5 py-1 rounded-full">${order.status || 'Pendiente'}</span>
+                        </div>
+
+                        <!-- Sección Geolocalización Cliente -->
+                        <div class="${innerBoxBg} border rounded-xl p-3 space-y-2 text-xs">
+                            <div class="flex items-start gap-2">
+                                <i class="fa-solid fa-location-dot text-amber-500 mt-0.5"></i>
+                                <div>
+                                    <span class="font-bold block">Dirección de Entrega:</span>
+                                    <span class="opacity-80">${deliv.address || 'Pucallpa'}</span>
+                                </div>
+                            </div>
+                            ${deliv.reference ? `
+                                <div class="flex items-start gap-2">
+                                    <i class="fa-solid fa-signs-post text-emerald-500 mt-0.5"></i>
+                                    <div>
+                                        <span class="font-bold block">Referencia:</span>
+                                        <span class="opacity-80">${deliv.reference}</span>
+                                    </div>
+                                </div>
+                            ` : ''}
+                            <div class="flex items-center justify-between pt-1 border-t border-current/10">
+                                <span class="text-[11px] font-semibold"><i class="fa-solid fa-satellite-dish text-emerald-500"></i> ${coords}</span>
+                                <div class="flex gap-1">
+                                    <button onclick="openRouteModal('${order.id}')" class="bg-blue-600 text-white text-[10px] font-bold px-2.5 py-1 rounded-lg hover:bg-blue-700 transition shadow-sm flex items-center gap-1">
+                                        <i class="fa-solid fa-route"></i> Ruta
+                                    </button>
+                                    <button onclick="openIncidentModal('${order.id}')" class="bg-red-600 text-white text-[10px] font-bold px-2.5 py-1 rounded-lg hover:bg-red-700 transition shadow-sm" title="Reportar Incidencia">
+                                        <i class="fa-solid fa-triangle-exclamation"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Info cliente y contacto rápido -->
+                        <div class="space-y-1.5 text-xs opacity-90">
+                            <div class="flex justify-between items-center bg-gray-500/10 p-2 rounded-xl border border-current/10">
+                                <span class="font-medium">Celular: <strong class="text-emerald-400">+51 ${order.clientPhone}</strong></span>
+                                <div class="flex gap-1.5">
+                                    <a href="tel:${order.clientPhone}" class="w-7 h-7 bg-emerald-500/20 text-emerald-400 rounded-lg flex items-center justify-center hover:bg-emerald-500/30 transition" title="Llamar">
+                                        <i class="fa-solid fa-phone text-xs"></i>
+                                    </a>
+                                    <a href="${whatsappLink}" target="_blank" class="w-7 h-7 bg-green-500/20 text-green-400 rounded-lg flex items-center justify-center hover:bg-green-500/30 transition" title="WhatsApp">
+                                        <i class="fa-brands fa-whatsapp text-xs"></i>
+                                    </a>
+                                </div>
+                            </div>
+                            <div class="flex justify-between px-1">
+                                <span>Método de Pago:</span>
+                                <strong class="font-bold">${order.paymentMethod}</strong>
+                            </div>
+                            <div class="flex justify-between px-1">
+                                <span>Total a cobrar (${order.items ? order.items.reduce((acc, i) => acc + i.quantity, 0) : 0} items):</span>
+                                <strong class="text-emerald-400 text-sm">S/ ${order.total ? order.total.toFixed(2) : '0.00'}</strong>
+                            </div>
+                        </div>
+
+                        ${order.paymentReceipt ? `
+                            <div class="flex items-center justify-between bg-gray-500/10 p-2 rounded-xl border border-current/10 text-xs">
+                                <span class="font-medium flex items-center gap-1.5"><i class="fa-solid fa-receipt text-emerald-400"></i> Voucher Yape/Plin:</span>
+                                <a href="${order.paymentReceipt}" target="_blank" class="text-emerald-400 font-bold underline">Ver captura</a>
+                            </div>
+                        ` : ''}
+
+                        ${order.deliveryPhoto ? `
+                            <div class="flex items-center justify-between bg-emerald-500/10 p-2 rounded-xl border border-emerald-500/30 text-xs">
+                                <span class="font-bold flex items-center gap-1.5"><i class="fa-solid fa-camera text-emerald-400"></i> Foto de Entrega:</span>
+                                <a href="${order.deliveryPhoto}" target="_blank" class="text-emerald-400 font-bold underline">Ver foto tomada</a>
+                            </div>
+                        ` : ''}
+
+                        <div class="flex gap-2 pt-1">
+                            <button onclick="updateOrderStatus('${order.id}', 'En ruta de reparto')" class="flex-1 bg-amber-500 text-white py-2 rounded-xl font-bold text-xs hover:bg-amber-600 transition shadow-sm">
+                                En Ruta 🛵
+                            </button>
+                            <button onclick="promptDeliveryPhoto('${order.id}')" class="flex-1 bg-emerald-700 text-white py-2 rounded-xl font-bold text-xs hover:bg-emerald-800 transition shadow-sm">
+                                Entregado ✅
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+    </script>
+</body>
+</html>

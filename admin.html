@@ -1,0 +1,1889 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel de Administración - ASTOREECO</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome para iconos -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Leaflet CSS para el mapa -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <!-- Chart.js para analítica financiera -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+
+
+
+<script>
+/* ASTORE ECO ROUTING V2 — SERVICIO CENTRAL DE RUTAS
+   API interna desacoplada: clientes -> servicio -> rutas.
+   Persistencia:
+   - astoreeco_routing_v2_state
+   - astoreeco_routing_v2_routes
+*/
+(function(){
+  const STATE='astoreeco_routing_v2_state';
+  const ROUTES='astoreeco_routing_v2_routes';
+  const ORDERS='astoreeco_orders';
+  const STORES='astoreeco_stores';
+  const DRIVERS='astoreeco_drivers';
+
+  const read=(k,d)=>{try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}};
+  const write=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+  const n=v=>Number.isFinite(Number(v))?Number(v):null;
+  const now=()=>new Date().toISOString();
+
+  function point(x){
+    if(!x)return null;
+    const lat=n(x.lat??x.latitude), lng=n(x.lng??x.lon??x.longitude);
+    return lat!==null&&lng!==null?{lat,lng}:null;
+  }
+  function hav(a,b){
+    if(!a||!b)return 999999;
+    const R=6371,p=Math.PI/180,d1=(b.lat-a.lat)*p,d2=(b.lng-a.lng)*p;
+    const q=Math.sin(d1/2)**2+Math.cos(a.lat*p)*Math.cos(b.lat*p)*Math.sin(d2/2)**2;
+    return 2*R*Math.asin(Math.sqrt(q));
+  }
+  function allStores(){
+    return read(STORES,[]).map((s,i)=>({...s,_i:i,_p:point(s)}));
+  }
+  function stops(order){
+    const ss=allStores(), g={};
+    (order.items||[]).forEach(it=>{
+      const key=String(it.storeId||it.storePhone||it.storeName||'SIN_TIENDA');
+      if(!g[key])g[key]={key,name:it.storeName||'Tienda',phone:it.storePhone||'',items:[]};
+      g[key].items.push(it);
+    });
+    return Object.values(g).map((x,i)=>{
+      const s=ss.find(z=>(x.phone&&String(z.phone)===String(x.phone)) ||
+                          (x.name&&String(z.name).toLowerCase()===String(x.name).toLowerCase()));
+      return {id:'stop-'+i,key:x.key,name:x.name,phone:x.phone,items:x.items,
+              location:s?s._p:null,store:s||null,status:'pendiente'};
+    });
+  }
+  function destination(order){
+    return point({lat:order.clientLat??order.deliveryLat,lng:order.clientLng??order.deliveryLng});
+  }
+
+  // Simple central optimizer. If a real road-router API is configured later,
+  // replace this function while preserving the returned contract.
+  function optimize(stops,start,end){
+    const pending=stops.filter(s=>s.location).slice();
+    let cur=start||pending[0]?.location||end, km=0, out=[];
+    while(pending.length){
+      let bi=0,bd=Infinity;
+      pending.forEach((s,i)=>{const d=hav(cur,s.location);if(d<bd){bd=d;bi=i;}});
+      const s=pending.splice(bi,1)[0];
+      km+=hav(cur,s.location);cur=s.location;out.push(s);
+    }
+    if(end)km+=hav(cur,end);
+    return {stops:out,km};
+  }
+
+  function fee(km,count){
+    let base=km<=2?5:km<=4?6:km<=6?7:km<=8?9:9+Math.ceil(km-8)*1.25;
+    base=Math.round(base*2)/2;
+    const extra=Math.min(Math.max(count-1,0)*1.5,4.5);
+    const total=Math.max(5,base+extra);
+    const driver=Math.max(4,Math.round(total*.75*2)/2);
+    return {deliveryFee:Number(total.toFixed(2)),driverPayout:Number(driver.toFixed(2)),
+            astorEcoMargin:Number((total-driver).toFixed(2))};
+  }
+
+  function build(order,driver){
+    const end=destination(order);
+    const ds=point(driver?.currentLocation);
+    const ss=stops(order);
+    const r=optimize(ss,ds,end);
+    const minutes=Math.max(5,Math.round(r.km/.32));
+    const econ=fee(r.km,r.stops.length);
+    return {
+      routeId:'AE-RV2-'+String(order.id||Date.now()),
+      orderId:order.id,
+      version:2,
+      engine:'ASTORE ECO ROUTING V2',
+      createdAt:now(),updatedAt:now(),
+      status:'planificada',
+      driverId:driver?.id||driver?.phone||null,
+      start:ds||null,
+      stops:r.stops.map((s,i)=>({
+        id:s.id,sequence:i+1,name:s.name,phone:s.phone,location:s.location,
+        itemCount:s.items.reduce((a,x)=>a+Number(x.quantity||1),0),
+        status:'pendiente'
+      })),
+      destination:end,
+      distanceKm:Number(r.km.toFixed(2)),
+      etaMinutes:minutes,
+      ...econ,
+      roadBased:false,
+      navigationProvider:'ASTORE ECO ROUTING',
+      notes:'V2 centralizada. El motor de calles reales puede conectarse al backend sin cambiar esta API.'
+    };
+  }
+
+  function save(order,driver){
+    const route=build(order,driver), db=read(ROUTES,{});
+    route.updatedAt=now(); db[order.id]=route; write(ROUTES,db);
+    const state=read(STATE,{requests:0,routesCreated:0,lastRequestAt:null});
+    state.requests=(state.requests||0)+1; state.routesCreated=(state.routesCreated||0)+1; state.lastRequestAt=now();
+    write(STATE,state); return route;
+  }
+  function get(orderId){return read(ROUTES,{})[orderId]||null;}
+  function assign(orderId,driver){
+    const db=read(ROUTES,{}), r=db[orderId]; if(!r)return null;
+    r.driverId=driver?.id||driver?.phone||null;r.status='asignada';r.updatedAt=now();
+    write(ROUTES,db);return r;
+  }
+  function setStopStatus(orderId,stopId,status){
+    const db=read(ROUTES,{}),r=db[orderId];if(!r)return null;
+    const s=r.stops.find(x=>x.id===stopId);if(!s)return r;
+    s.status=status;r.updatedAt=now();
+    if(r.stops.length && r.stops.every(x=>x.status==='recogido'||x.status==='entregado'))r.status='en_entrega';
+    write(ROUTES,db);return r;
+  }
+  function setStatus(orderId,status){
+    const db=read(ROUTES,{}),r=db[orderId];if(!r)return null;
+    r.status=status;r.updatedAt=now();write(ROUTES,db);return r;
+  }
+  function list(){return Object.values(read(ROUTES,{}));}
+
+  window.AstoreEcoRoutingV2={
+    apiVersion:'2.0',
+    createRoute:save,getRoute:get,assignDriver:assign,
+    updateStop:setStopStatus,updateStatus:setStatus,
+    listRoutes:list,calculate:build
+  };
+})();
+</script>
+
+
+<script>
+/* ASTORE ECO ROUTING V3 — BRIDGE
+   Sincroniza el ecosistema con el backend central.
+*/
+(function(){
+  const DEFAULT=(location.protocol.startsWith('http') ? location.origin : 'http://localhost:8080');
+  const API=localStorage.getItem('ASTORE_ECO_API_URL')||DEFAULT;
+  const key='astoreeco_orders';
+  let busy=false;
+
+  async function request(path, options){
+    const r=await fetch(API+path,{headers:{'Content-Type':'application/json',...(options&&options.headers||{})},...(options||{})});
+    if(!r.ok) throw new Error('API '+r.status);
+    return r.json();
+  }
+
+  async function syncLocalOrders(){
+    if(busy)return; busy=true;
+    try{
+      const local=JSON.parse(localStorage.getItem(key)||'[]');
+      if(Array.isArray(local)&&local.length) await request('/api/orders/sync',{method:'POST',body:JSON.stringify({orders:local})});
+      const remote=await request('/api/orders');
+      const map=new Map();
+      [...local,...(remote.orders||[])].forEach(o=>{if(o?.id)map.set(o.id,o)});
+      const merged=[...map.values()];
+      if(JSON.stringify(merged)!==JSON.stringify(local)) localStorage.setItem(key,JSON.stringify(merged));
+    }catch(e){ console.warn('ASTORE ECO backend no disponible:',e.message); }
+    finally{busy=false;}
+  }
+
+  async function syncStoresAndDrivers(){
+    try{
+      const stores=JSON.parse(localStorage.getItem('astoreeco_stores')||'[]');
+      if(stores.length) await request('/api/stores/sync',{method:'POST',body:JSON.stringify({stores})});
+      const drivers=JSON.parse(localStorage.getItem('astoreeco_drivers')||'[]');
+      if(drivers.length) await request('/api/drivers/sync',{method:'POST',body:JSON.stringify({drivers})});
+    }catch(e){}
+  }
+
+  async function refreshRouteForLatest(){
+    try{
+      const orders=JSON.parse(localStorage.getItem(key)||'[]');
+      const latest=orders[orders.length-1];
+      if(!latest?.id)return;
+      const existing=await fetch(API+'/api/routes/'+encodeURIComponent(latest.id));
+      if(!existing.ok){
+        await request('/api/routes/create',{method:'POST',body:JSON.stringify({order:latest})});
+      }
+    }catch(e){}
+  }
+
+  window.AstoreEcoBackendV3={API,syncLocalOrders,syncStoresAndDrivers,refreshRouteForLatest};
+  function start(){syncStoresAndDrivers();syncLocalOrders();refreshRouteForLatest();setInterval(syncLocalOrders,5000);setInterval(syncStoresAndDrivers,10000);}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+})();
+</script>
+
+</head>
+<body class="bg-gray-100 font-sans text-gray-800">
+    <!-- Header Profesional -->
+    <header class="bg-gradient-to-r from-emerald-800 to-emerald-700 text-white shadow-lg sticky top-0 z-40">
+        <div class="max-w-7xl mx-auto px-4 py-3.5 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-emerald-900/50 flex items-center justify-center text-emerald-200 text-lg font-bold shadow-inner">
+                    🌱
+                </div>
+                <div>
+                    <h1 class="text-base font-extrabold tracking-wide">ASTORE ECO</h1>
+                    <p class="text-[11px] text-emerald-200">Panel de Control y Administración</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2.5">
+                <a href="repartidor.html" target="_blank" class="text-xs bg-emerald-900/60 hover:bg-emerald-900 text-emerald-100 px-3.5 py-2 rounded-xl font-semibold transition flex items-center gap-2 shadow-sm border border-emerald-600/30">
+                    <i class="fa-solid fa-motorcycle text-emerald-300"></i> Ver Repartidor
+                </a>
+                <span class="text-xs bg-emerald-900/80 px-3 py-2 rounded-xl font-medium border border-emerald-600/30">📍 Pucallpa</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="max-w-7xl mx-auto px-4 py-6">
+        <!-- Navegación de Pestañas Moderna (Pills) -->
+        <nav class="bg-white p-2 rounded-2xl shadow-sm border border-gray-200/80 mb-6 flex flex-wrap gap-1.5 items-center">
+            <button onclick="switchTab('store')" id="btn-store" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition bg-emerald-700 text-white shadow-sm">
+                <i class="fa-solid fa-store"></i> Registrar Tienda
+            </button>
+            <button onclick="switchTab('driver')" id="btn-driver" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-user-tie"></i> Repartidor
+            </button>
+            <button onclick="switchTab('admins')" id="btn-admins" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-user-shield"></i> Administradores
+            </button>
+            <button onclick="switchTab('clients')" id="btn-clients" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-users"></i> Clientes & Compras
+            </button>
+            <button onclick="switchTab('list')" id="btn-list" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-database"></i> Registros & Backup
+            </button>
+            <button onclick="switchTab('orders')" id="btn-orders" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-clipboard-list"></i> Monitoreo Pedidos
+            </button>
+            <button onclick="switchTab('analytics')" id="btn-analytics" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-chart-pie"></i> Analítica
+            </button>
+            <button onclick="switchTab('gps')" id="btn-gps" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-location-dot"></i> GPS en Vivo
+            </button>
+            <button onclick="switchTab('features')" id="btn-features" class="tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100">
+                <i class="fa-solid fa-toggle-on"></i> ⭐ PRO
+            </button>
+        </nav>
+
+        <!-- FUNCIONES Y SUSCRIPCIONES POR TIENDA -->
+        <section id="section-features" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-6">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 pb-4 border-b border-gray-100">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">⭐ PRO</h2>
+                    <p class="text-xs text-gray-500 mt-1">Administra el acceso PRO de cada comerciante y habilita los módulos especializados que haya contratado.</p>
+                </div>
+                <button onclick="renderStoreFeatures()" class="bg-emerald-50 text-emerald-700 text-xs font-bold px-4 py-2.5 rounded-xl border border-emerald-200"><i class="fa-solid fa-rotate-right"></i> Actualizar</button>
+            </div>
+            <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4 text-xs text-blue-900"><b>PRO:</b> activa el acceso PRO y luego habilita los módulos que correspondan al rubro del comerciante. Los módulos desactivados no aparecen en su Panel Tienda.</div>
+            <div id="storeFeaturesList" class="space-y-3"><p class="text-center text-gray-500 py-8 text-sm">No hay tiendas registradas.</p></div>
+        </section>
+
+        <!-- Store Form Section -->
+        <section id="form-store" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80">
+            <div class="flex justify-between items-center mb-6 pb-4 border-b border-gray-100">
+                <div>
+                    <h2 id="storeFormTitle" class="text-lg font-bold text-gray-900">Registrar Nuevo Comercio / Productor</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Ingresa los datos de la tienda, RUC y ubícala en el mapa interactivo.</p>
+                </div>
+                <button type="button" id="cancelStoreEdit" onclick="resetStoreForm()" class="hidden text-xs bg-red-50 text-red-600 px-3 py-1.5 rounded-xl font-semibold hover:bg-red-100 transition">Cancelar Edición</button>
+            </div>
+            <form id="storeForm" onsubmit="handleStoreSubmit(event)" class="space-y-5">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Nombre Comercial</label>
+                        <input type="text" id="storeName" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">RUC (11 dígitos)</label>
+                        <input type="text" id="storeRuc" maxlength="11" pattern="[0-9]{11}" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="20123456789">
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Categoría y Modalidad de Entrega</label>
+                        <select id="storeCategory" onchange="updateCategoryHint()" class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                            <option value="Campo">Campo (1 día de anticipación)</option>
+                            <option value="Ciudad">Ciudad (Mismo día)</option>
+                        </select>
+                        <p id="categoryHint" class="text-xs text-amber-600 mt-2 font-medium flex items-center gap-1.5 bg-amber-50 p-2.5 rounded-xl border border-amber-200/60">🌾 Los pedidos de Campo se programan con 1 día de anticipación.</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Celular de Acceso (Login)</label>
+                        <input type="tel" id="storePhone" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="999999999">
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">PIN de Acceso (6 dígitos)</label>
+                        <input type="password" id="storePin" maxlength="6" pattern="[0-9]{6}" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="123456">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Dirección (Selecciona en el mapa abajo)</label>
+                        <input type="text" id="storeAddress" required readonly class="w-full rounded-xl bg-gray-50 border-gray-300 shadow-sm border p-3 text-sm text-gray-600" placeholder="Haz clic en el mapa...">
+                    </div>
+                </div>
+
+                <!-- Mapa Interactivo -->
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Ubicación en el Mapa (Pucallpa)</label>
+                    <div id="map" class="w-full h-72 rounded-2xl border border-gray-300 shadow-inner z-0"></div>
+                    <p class="text-xs text-gray-500 mt-1.5 flex items-center gap-1">📍 Haz clic sobre el mapa para marcar la ubicación exacta del comercio.</p>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Descripción Corta</label>
+                    <textarea id="storeDesc" rows="2" class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="Ej. Cítricos y hortalizas ecológicas"></textarea>
+                </div>
+                <button type="submit" id="storeSubmitBtn" class="w-full bg-emerald-600 text-white font-bold py-3.5 px-4 rounded-xl hover:bg-emerald-700 transition shadow-md shadow-emerald-600/20 text-sm">Guardar Tienda</button>
+            </form>
+        </section>
+
+        <!-- Driver Form Section -->
+        <section id="form-driver" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden">
+            <div class="flex justify-between items-center mb-6 pb-4 border-b border-gray-100">
+                <div>
+                    <h2 id="driverFormTitle" class="text-lg font-bold text-gray-900">Registrar Nuevo Repartidor</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Configura las credenciales de acceso para el personal de reparto.</p>
+                </div>
+                <button type="button" id="cancelDriverEdit" onclick="resetDriverForm()" class="hidden text-xs bg-red-50 text-red-600 px-3 py-1.5 rounded-xl font-semibold hover:bg-red-100 transition">Cancelar Edición</button>
+            </div>
+            <form id="driverForm" onsubmit="handleDriverSubmit(event)" class="space-y-5">
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Nombre Completo</label>
+                    <input type="text" id="driverName" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">DNI</label>
+                        <input type="text" id="driverDni" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Celular de Acceso (Login)</label>
+                        <input type="tel" id="driverPhone" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="999999999">
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">PIN de Acceso (6 dígitos)</label>
+                        <input type="password" id="driverPin" maxlength="6" pattern="[0-9]{6}" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="123456">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Tipo de Vehículo</label>
+                        <select id="driverVehicle" class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                            <option value="Moto">Moto</option>
+                            <option value="Bicicleta">Bicicleta</option>
+                            <option value="Auto">Auto</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Número de Placa (si aplica)</label>
+                    <input type="text" id="driverPlate" class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                </div>
+                <button type="submit" id="driverSubmitBtn" class="w-full bg-emerald-600 text-white font-bold py-3.5 px-4 rounded-xl hover:bg-emerald-700 transition shadow-md shadow-emerald-600/20 text-sm">Guardar Repartidor</button>
+            </form>
+        </section>
+
+        <!-- Admins Section -->
+        <section id="section-admins" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-6">
+            <div class="flex justify-between items-center pb-4 border-b border-gray-100">
+                <div>
+                    <h2 id="adminFormTitle" class="text-lg font-bold text-gray-900">Gestión de Administradores</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Crea y administra cuentas con acceso al panel de control.</p>
+                </div>
+                <button type="button" id="cancelAdminEdit" onclick="resetAdminForm()" class="hidden text-xs bg-red-50 text-red-600 px-3 py-1.5 rounded-xl font-semibold hover:bg-red-100 transition">Cancelar Edición</button>
+            </div>
+            
+            <form id="adminForm" onsubmit="handleAdminSubmit(event)" class="space-y-5 bg-gray-50/50 p-5 rounded-2xl border border-gray-200/60">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Nombre Completo</label>
+                        <input type="text" id="adminName" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="Nombre del administrador">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Celular / Usuario (Login)</label>
+                        <input type="tel" id="adminPhone" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="999999999">
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">PIN de Acceso (6 dígitos)</label>
+                        <input type="password" id="adminPin" maxlength="6" pattern="[0-9]{6}" required class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500" placeholder="123456">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Rol / Nivel de Acceso</label>
+                        <select id="adminRole" class="w-full rounded-xl border-gray-300 shadow-sm border p-3 text-sm focus:ring-2 focus:ring-emerald-500">
+                            <option value="Administrador Principal">Administrador Principal</option>
+                            <option value="Moderador / Operador">Moderador / Operador</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="submit" id="adminSubmitBtn" class="w-full bg-emerald-600 text-white font-bold py-3 px-4 rounded-xl hover:bg-emerald-700 transition shadow-md shadow-emerald-600/20 text-sm">Registrar Administrador</button>
+            </form>
+
+            <div>
+                <h3 class="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2">
+                    <i class="fa-solid fa-user-shield text-emerald-600"></i> Administradores Registrados
+                </h3>
+                <div id="adminsAccordionList" class="space-y-3">
+                    <p class="text-center text-gray-500 py-6 text-sm">No hay administradores registrados aún.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Clients Section -->
+        <section id="section-clients" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-6">
+            <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 pb-4 border-b border-gray-100">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">Clientes Registrados e Historial de Compras</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Lista de usuarios clientes y el detalle completo de todas sus compras realizadas.</p>
+                </div>
+                <button onclick="renderClients()" class="bg-emerald-50 text-emerald-700 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-emerald-100 transition flex items-center gap-2 border border-emerald-200/60 shadow-sm">
+                    <i class="fa-solid fa-rotate-right"></i> Actualizar Lista
+                </button>
+            </div>
+            
+            <div id="clientsAccordionList" class="space-y-3">
+                <p class="text-center text-gray-500 py-6 text-sm">No hay clientes registrados aún.</p>
+            </div>
+        </section>
+
+        <!-- List Section & Dashboard -->
+        <section id="section-list" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-6">
+            <!-- Dashboard Stats Cards -->
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+                <div class="bg-emerald-50/80 border border-emerald-200/60 p-4 rounded-2xl text-center shadow-sm">
+                    <div class="text-emerald-600 mb-1 text-lg"><i class="fa-solid fa-store"></i></div>
+                    <p class="text-[11px] text-emerald-700 font-bold uppercase tracking-wider">Total Tiendas</p>
+                    <h3 id="statTotalStores" class="text-2xl font-extrabold text-emerald-900 mt-1">0</h3>
+                </div>
+                <div class="bg-amber-50/80 border border-amber-200/60 p-4 rounded-2xl text-center shadow-sm">
+                    <div class="text-amber-600 mb-1 text-lg"><i class="fa-solid fa-seedling"></i></div>
+                    <p class="text-[11px] text-amber-700 font-bold uppercase tracking-wider">Prod. Campo (1d)</p>
+                    <h3 id="statFieldStores" class="text-2xl font-extrabold text-amber-900 mt-1">0</h3>
+                </div>
+                <div class="bg-blue-50/80 border border-blue-200/60 p-4 rounded-2xl text-center shadow-sm">
+                    <div class="text-blue-600 mb-1 text-lg"><i class="fa-solid fa-city"></i></div>
+                    <p class="text-[11px] text-blue-700 font-bold uppercase tracking-wider">Ciudad (Hoy)</p>
+                    <h3 id="statCityStores" class="text-2xl font-extrabold text-blue-900 mt-1">0</h3>
+                </div>
+                <div class="bg-purple-50/80 border border-purple-200/60 p-4 rounded-2xl text-center shadow-sm">
+                    <div class="text-purple-600 mb-1 text-lg"><i class="fa-solid fa-motorcycle"></i></div>
+                    <p class="text-[11px] text-purple-700 font-bold uppercase tracking-wider">Repartidores</p>
+                    <h3 id="statTotalDrivers" class="text-2xl font-extrabold text-purple-900 mt-1">0</h3>
+                </div>
+                <div class="bg-indigo-50/80 border border-indigo-200/60 p-4 rounded-2xl text-center shadow-sm col-span-2 md:col-span-1">
+                    <div class="text-indigo-600 mb-1 text-lg"><i class="fa-solid fa-users"></i></div>
+                    <p class="text-[11px] text-indigo-700 font-bold uppercase tracking-wider">Clientes</p>
+                    <h3 id="statTotalClients" class="text-2xl font-extrabold text-indigo-900 mt-1">0</h3>
+                </div>
+            </div>
+
+            <!-- Backup Control Bar -->
+            <div class="flex flex-wrap justify-between items-center gap-4 bg-gray-50 p-4 rounded-2xl border border-gray-200/80">
+                <div>
+                    <h4 class="text-sm font-bold text-gray-800">Copia de Seguridad (Backup)</h4>
+                    <p class="text-xs text-gray-500">Exporta o restaura toda la información local de la app de forma segura.</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="exportData()" class="bg-gray-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-gray-800 transition flex items-center gap-1.5 shadow-sm">
+                        <i class="fa-solid fa-download"></i> Exportar JSON
+                    </button>
+                    <label class="bg-emerald-600 text-white text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-emerald-700 transition cursor-pointer flex items-center gap-1.5 shadow-sm shadow-emerald-600/20">
+                        <i class="fa-solid fa-upload"></i> Importar JSON <input type="file" id="importFile" accept=".json" onchange="importData(event)" class="hidden">
+                    </label>
+                </div>
+            </div>
+
+            <!-- Search and Filter Bar -->
+            <div class="flex flex-col md:flex-row gap-3 items-center justify-between">
+                <div class="relative w-full md:w-1/2">
+                    <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-400">
+                        <i class="fa-solid fa-magnifying-glass text-xs"></i>
+                    </span>
+                    <input type="text" id="searchInput" oninput="renderLists()" placeholder="Buscar por nombre, RUC o celular..." class="w-full pl-10 pr-4 py-2.5 text-sm border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500">
+                </div>
+                <div class="flex gap-2 w-full md:w-auto overflow-x-auto pb-1 md:pb-0">
+                    <button onclick="setFilter('all')" id="filter-all" class="px-4 py-2 text-xs font-bold rounded-xl bg-emerald-700 text-white transition shadow-sm">Todos</button>
+                    <button onclick="setFilter('Campo')" id="filter-campo" class="px-4 py-2 text-xs font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition">Campo</button>
+                    <button onclick="setFilter('Ciudad')" id="filter-ciudad" class="px-4 py-2 text-xs font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition">Ciudad</button>
+                </div>
+            </div>
+
+            <!-- Stores List Accordion -->
+            <div>
+                <h3 class="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2">
+                    <i class="fa-solid fa-store text-emerald-600"></i> Tiendas Registradas
+                </h3>
+                <div id="storesAccordionList" class="space-y-3">
+                    <p class="text-center text-gray-500 py-6 text-sm">No hay tiendas registradas aún.</p>
+                </div>
+            </div>
+
+            <hr class="border-gray-200">
+
+            <!-- Drivers List Accordion -->
+            <div>
+                <h3 class="text-sm font-bold text-gray-800 mb-3 flex items-center gap-2">
+                    <i class="fa-solid fa-motorcycle text-purple-600"></i> Repartidores Registrados
+                </h3>
+                <div id="driversAccordionList" class="space-y-3">
+                    <p class="text-center text-gray-500 py-6 text-sm">No hay repartidores registrados aún.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Orders Monitoring Section -->
+        <section id="section-orders" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-5">
+            <div class="flex justify-between items-center pb-4 border-b border-gray-100">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">Monitoreo Sincronizado en Vivo</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Supervisa pedidos y comprobantes de pago en tiempo real.</p>
+                </div>
+                <button onclick="renderOrders()" class="bg-emerald-50 text-emerald-700 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-emerald-100 transition flex items-center gap-2 border border-emerald-200/60 shadow-sm">
+                    <i class="fa-solid fa-rotate-right"></i> Actualizar Pedidos
+                </button>
+            </div>
+            
+            <div class="overflow-x-auto rounded-2xl border border-gray-200">
+                <table class="min-w-full divide-y divide-gray-200 text-sm">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-4 py-3 text-left font-bold text-gray-600 uppercase text-[11px]">ID / Fecha</th>
+                            <th class="px-4 py-3 text-left font-bold text-gray-600 uppercase text-[11px]">Cliente / Dirección</th>
+                            <th class="px-4 py-3 text-left font-bold text-gray-600 uppercase text-[11px]">Pago & Foto Entrega</th>
+                            <th class="px-4 py-3 text-left font-bold text-gray-600 uppercase text-[11px]">Estado Actual</th>
+                            <th class="px-4 py-3 text-center font-bold text-gray-600 uppercase text-[11px]">Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ordersTableBody" class="divide-y divide-gray-200 bg-white">
+                        <tr><td colspan="5" class="px-4 py-6 text-center text-gray-500 text-sm">No hay pedidos registrados en el sistema.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- SECCIÓN: ANALÍTICA FINANCIERA -->
+        <section id="section-analytics" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-6">
+            <div class="flex flex-wrap justify-between items-center gap-4 pb-4 border-b border-gray-100">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">Analítica y Reportes Financieros</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Resumen de ingresos, volumen de ventas y exportación de reportes.</p>
+                </div>
+                <button onclick="exportCSVReport()" class="bg-emerald-600 text-white text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-emerald-700 transition flex items-center gap-2 shadow-md shadow-emerald-600/20">
+                    <i class="fa-solid fa-file-excel"></i> Exportar CSV / Excel
+                </button>
+            </div>
+
+            <!-- Tarjetas de Resumen Financiero -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+                <div class="bg-emerald-50/80 border border-emerald-200/80 p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-emerald-700 font-bold uppercase tracking-wider">Ventas Totales Registradas</p>
+                    <h3 id="analyticsTotalRevenue" class="text-3xl font-extrabold text-emerald-950 mt-1.5">S/ 0.00</h3>
+                </div>
+                <div class="bg-blue-50/80 border border-blue-200/80 p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-blue-700 font-bold uppercase tracking-wider">Total Pedidos Procesados</p>
+                    <h3 id="analyticsTotalOrders" class="text-3xl font-extrabold text-blue-950 mt-1.5">0</h3>
+                </div>
+                <div class="bg-amber-50/80 border border-amber-200/80 p-5 rounded-2xl shadow-sm">
+                    <p class="text-xs text-amber-700 font-bold uppercase tracking-wider">Ticket Promedio por Pedido</p>
+                    <h3 id="analyticsAvgTicket" class="text-3xl font-extrabold text-amber-950 mt-1.5">S/ 0.00</h3>
+                </div>
+            </div>
+
+            <!-- Gráficos Estadísticos -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+                <div class="bg-gray-50/80 p-5 rounded-2xl border border-gray-200/80 shadow-sm">
+                    <h3 class="text-xs font-bold text-gray-700 mb-3 text-center uppercase tracking-wider">Estado de los Pedidos</h3>
+                    <div class="relative h-64 flex items-center justify-center">
+                        <canvas id="ordersStatusChart"></canvas>
+                    </div>
+                </div>
+                <div class="bg-gray-50/80 p-5 rounded-2xl border border-gray-200/80 shadow-sm">
+                    <h3 class="text-xs font-bold text-gray-700 mb-3 text-center uppercase tracking-wider">Métodos de Pago Utilizados</h3>
+                    <div class="relative h-64 flex items-center justify-center">
+                        <canvas id="paymentMethodsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- SECCIÓN: FLOTA GPS EN VIVO -->
+        <section id="section-gps" class="bg-white p-6 md:p-8 rounded-3xl shadow-sm border border-gray-200/80 hidden space-y-5">
+            <div class="flex justify-between items-center pb-4 border-b border-gray-100">
+                <div>
+                    <h2 class="text-lg font-bold text-gray-900">Rastreo GPS de Repartidores en Vivo</h2>
+                    <p class="text-xs text-gray-500 mt-0.5">Visualiza la posición geográfica en tiempo real de la flota.</p>
+                </div>
+                <button onclick="initOrUpdateGPSMap()" class="bg-emerald-50 text-emerald-700 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-emerald-100 transition flex items-center gap-2 border border-emerald-200/60 shadow-sm">
+                    <i class="fa-solid fa-rotate-right"></i> Actualizar Posiciones
+                </button>
+            </div>
+
+            <div id="gpsMap" class="w-full h-96 rounded-2xl border border-gray-300 z-0 shadow-inner"></div>
+            <div id="gpsStatusList" class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
+                <!-- Se llena dinámicamente con los repartidores -->
+            </div>
+        </section>
+    </main>
+
+    <!-- MODAL VISOR DE IMÁGENES EN GRANDE -->
+    <div id="imageModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4" onclick="closeImageModal()">
+        <div class="relative max-w-2xl w-full bg-white rounded-3xl overflow-hidden shadow-2xl p-4 flex flex-col items-center" onclick="event.stopPropagation()">
+            <button onclick="closeImageModal()" class="absolute top-4 right-4 bg-gray-900 text-white w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold hover:bg-gray-800 transition z-10 shadow-lg">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+            <h3 class="text-xs font-bold text-gray-700 mb-3 uppercase tracking-wider">Vista Previa de Imagen</h3>
+            <img id="modalImageFull" src="" class="w-full max-h-[75vh] object-contain rounded-2xl border border-gray-200 bg-gray-50">
+        </div>
+    </div>
+
+    <!-- Modal Personalizado -->
+    <div id="customModal" class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center hidden z-50 p-4">
+        <div class="bg-white rounded-3xl p-6 md:p-8 max-w-sm w-full text-center shadow-2xl transform transition-all border border-gray-100">
+            <div id="modalIcon" class="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold shadow-inner">✓</div>
+            <h3 id="modalTitle" class="text-lg font-bold text-gray-900 mb-2">¡Operación Exitosa!</h3>
+            <p id="modalMessage" class="text-sm text-gray-600 mb-6 leading-relaxed">Mensaje descriptivo aquí.</p>
+            <div id="modalButtons" class="flex gap-2">
+                <button onclick="closeModal()" class="w-full bg-emerald-600 text-white font-bold py-3 px-4 rounded-xl hover:bg-emerald-700 transition shadow-md shadow-emerald-600/20 text-sm">Aceptar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- JavaScript Logic -->
+    <script>
+        let storesData = JSON.parse(localStorage.getItem('astoreeco_stores')) || [];
+        let driversData = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+        let clientsData = JSON.parse(localStorage.getItem('astoreeco_clients')) || JSON.parse(localStorage.getItem('astoreeco_users')) || [];
+        let adminsData = JSON.parse(localStorage.getItem('astoreeco_admins')) || [
+            { name: 'Administrador Principal', phone: '999999999', pin: '123456', role: 'Administrador Principal' }
+        ];
+        
+        let map = null;
+        let marker = null;
+        let currentLat = null;
+        let currentLng = null;
+
+        let gpsMap = null;
+        let gpsMarkers = {};
+
+        let statusChartInstance = null;
+        let paymentChartInstance = null;
+
+        let editingStoreIndex = null;
+        let editingDriverIndex = null;
+        let editingAdminIndex = null;
+        let currentFilter = 'all';
+
+        window.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            updateCategoryHint();
+            renderOrders();
+            renderClients();
+            renderAdmins();
+
+            window.addEventListener('storage', (e) => {
+                if (e.key === 'astoreeco_orders') {
+                    renderOrders();
+                    renderAnalytics();
+                    renderClients();
+                }
+                if (e.key === 'astoreeco_clients' || e.key === 'astoreeco_users') {
+                    renderClients();
+                }
+                if (e.key === 'astoreeco_admins') {
+                    renderAdmins();
+                }
+            });
+        });
+
+        function openImageModal(base64Url) {
+            document.getElementById('modalImageFull').src = base64Url;
+            document.getElementById('imageModal').classList.remove('hidden');
+        }
+
+        function closeImageModal() {
+            document.getElementById('imageModal').classList.add('hidden');
+            document.getElementById('modalImageFull').src = '';
+        }
+
+        function updateCategoryHint() {
+            const cat = document.getElementById('storeCategory').value;
+            const hint = document.getElementById('categoryHint');
+            if (cat === 'Campo') {
+                hint.innerHTML = '<i class="fa-solid fa-seedling"></i> Los pedidos de Campo se programan con 1 día de anticipación.';
+                hint.className = "text-xs text-amber-700 mt-2 font-medium flex items-center gap-1.5 bg-amber-50 p-2.5 rounded-xl border border-amber-200/60";
+            } else {
+                hint.innerHTML = '<i class="fa-solid fa-city"></i> Los pedidos de Ciudad se entregan en el mismo día.';
+                hint.className = "text-xs text-blue-700 mt-2 font-medium flex items-center gap-1.5 bg-blue-50 p-2.5 rounded-xl border border-blue-200/60";
+            }
+        }
+
+        function showModal(title, message, isError = false, customButtons = null) {
+            document.getElementById('modalTitle').innerText = title;
+            document.getElementById('modalMessage').innerText = message;
+            const icon = document.getElementById('modalIcon');
+            const btnContainer = document.getElementById('modalButtons');
+
+            if(isError) {
+                icon.className = "w-16 h-16 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold shadow-inner";
+                icon.innerText = "✕";
+            } else {
+                icon.className = "w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold shadow-inner";
+                icon.innerText = "✓";
+            }
+
+            if (customButtons) {
+                btnContainer.innerHTML = customButtons;
+            } else {
+                btnContainer.innerHTML = `<button onclick="closeModal()" class="w-full bg-emerald-600 text-white font-bold py-3 px-4 rounded-xl hover:bg-emerald-700 transition shadow-md shadow-emerald-600/20 text-sm">Aceptar</button>`;
+            }
+
+            document.getElementById('customModal').classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('customModal').classList.add('hidden');
+        }
+
+        function initMap() {
+            if (map) return;
+            map = L.map('map').setView([-8.3791, -74.5539], 13);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            map.on('click', function(e) {
+                currentLat = e.latlng.lat;
+                currentLng = e.latlng.lng;
+
+                if (marker) {
+                    marker.setLatLng([currentLat, currentLng]);
+                } else {
+                    marker = L.marker([currentLat, currentLng]).addTo(map);
+                }
+
+                document.getElementById('storeAddress').value = "Buscando dirección...";
+
+                fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${currentLat}&lon=${currentLng}&zoom=18&addressdetails=1`)
+                    .then(response => response.json())
+                    .then(data => {
+                        const address = data.display_name || `Lat: ${currentLat.toFixed(4)}, Lon: ${currentLng.toFixed(4)}`;
+                        document.getElementById('storeAddress').value = address;
+                    })
+                    .catch(error => {
+                        console.error('Error al obtener la dirección:', error);
+                        document.getElementById('storeAddress').value = `Lat: ${currentLat.toFixed(4)}, Lon: ${currentLng.toFixed(4)}`;
+                    });
+            });
+        }
+
+        function switchTab(tab) {
+            const sections = ['form-store', 'form-driver', 'section-admins', 'section-clients', 'section-list', 'section-orders', 'section-analytics', 'section-gps', 'section-features'];
+            const buttons = ['btn-store', 'btn-driver', 'btn-admins', 'btn-clients', 'btn-list', 'btn-orders', 'btn-analytics', 'btn-gps', 'btn-features'];
+
+            sections.forEach(secId => document.getElementById(secId).classList.add('hidden'));
+            buttons.forEach(btnId => {
+                const b = document.getElementById(btnId);
+                b.className = "tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl transition text-gray-600 hover:bg-gray-100";
+            });
+
+            const activeSecMap = {
+                'store': 'form-store',
+                'driver': 'form-driver',
+                'admins': 'section-admins',
+                'clients': 'section-clients',
+                'list': 'section-list',
+                'orders': 'section-orders',
+                'analytics': 'section-analytics',
+                'gps': 'section-gps',
+                'features': 'section-features'
+            };
+
+            document.getElementById(activeSecMap[tab]).classList.remove('hidden');
+            const activeBtn = document.getElementById('btn-' + tab);
+            activeBtn.className = "tab-btn flex items-center gap-2 py-2 px-3.5 font-bold text-xs rounded-xl transition bg-emerald-700 text-white shadow-sm";
+
+            if (tab === 'store' && map) {
+                setTimeout(() => { map.invalidateSize(); }, 100);
+            }
+            if (tab === 'admins') { renderAdmins(); }
+            if (tab === 'clients') { renderClients(); }
+            if (tab === 'list') { renderLists(); }
+            if (tab === 'orders') { renderOrders(); }
+            if (tab === 'analytics') { renderAnalytics(); }
+            if (tab === 'features') { renderStoreFeatures(); }
+            if (tab === 'gps') { initOrUpdateGPSMap(); }
+        }
+
+        function handleStoreSubmit(e) {
+            e.preventDefault();
+            const ruc = document.getElementById('storeRuc').value;
+            if (ruc.length !== 11) {
+                showModal('Atención', 'El RUC debe tener exactamente 11 dígitos.', true);
+                return;
+            }
+
+            const pin = document.getElementById('storePin').value;
+            if (pin.length !== 6) {
+                showModal('Atención', 'El PIN debe tener exactamente 6 dígitos.', true);
+                return;
+            }
+
+            const address = document.getElementById('storeAddress').value;
+            if (!address || address === 'Buscando dirección...' || address === 'Haz clic en el mapa...') {
+                showModal('Atención', 'Por favor selecciona una ubicación válida haciendo clic en el mapa.', true);
+                return;
+            }
+
+            const category = document.getElementById('storeCategory').value;
+            const store = {
+                name: document.getElementById('storeName').value,
+                ruc: ruc,
+                category: category,
+                deliveryRule: category === 'Campo' ? '1 día de anticipación' : 'Mismo día',
+                phone: document.getElementById('storePhone').value,
+                pin: pin,
+                address: address,
+                desc: document.getElementById('storeDesc').value,
+                lat: currentLat,
+                lng: currentLng
+            };
+            
+            if (editingStoreIndex !== null) {
+                storesData[editingStoreIndex] = store;
+                showModal('¡Actualización Exitosa!', 'Los datos de la tienda se han actualizado correctamente.');
+                resetStoreForm();
+            } else {
+                storesData.push(store);
+                showModal('¡Registro Exitoso!', 'La tienda y sus credenciales se han sincronizado correctamente.');
+                document.getElementById('storeForm').reset();
+                document.getElementById('storeAddress').value = '';
+                updateCategoryHint();
+                if (marker) {
+                    map.removeLayer(marker);
+                    marker = null;
+                }
+                currentLat = null;
+                currentLng = null;
+            }
+            
+            localStorage.setItem('astoreeco_stores', JSON.stringify(storesData));
+        }
+
+        function handleDriverSubmit(e) {
+            e.preventDefault();
+            const pin = document.getElementById('driverPin').value;
+            if (pin.length !== 6) {
+                showModal('Atención', 'El PIN debe tener exactamente 6 dígitos.', true);
+                return;
+            }
+
+            const driver = {
+                name: document.getElementById('driverName').value,
+                dni: document.getElementById('driverDni').value,
+                phone: document.getElementById('driverPhone').value,
+                pin: pin,
+                vehicle: document.getElementById('driverVehicle').value,
+                plate: document.getElementById('driverPlate').value
+            };
+            
+            if (editingDriverIndex !== null) {
+                driversData[editingDriverIndex] = driver;
+                showModal('¡Actualización Exitosa!', 'Los datos del repartidor se han actualizado correctamente.');
+                resetDriverForm();
+            } else {
+                driversData.push(driver);
+                showModal('¡Registro Exitoso!', 'El repartidor y sus credenciales se han sincronizado correctamente.');
+                document.getElementById('driverForm').reset();
+            }
+
+            localStorage.setItem('astoreeco_drivers', JSON.stringify(driversData));
+        }
+
+        function handleAdminSubmit(e) {
+            e.preventDefault();
+            const pin = document.getElementById('adminPin').value;
+            if (pin.length !== 6) {
+                showModal('Atención', 'El PIN debe tener exactamente 6 dígitos.', true);
+                return;
+            }
+
+            const admin = {
+                name: document.getElementById('adminName').value,
+                phone: document.getElementById('adminPhone').value,
+                pin: pin,
+                role: document.getElementById('adminRole').value
+            };
+
+            if (editingAdminIndex !== null) {
+                adminsData[editingAdminIndex] = admin;
+                showModal('¡Actualización Exitosa!', 'Los datos del administrador se han actualizado correctamente.');
+                resetAdminForm();
+            } else {
+                adminsData.push(admin);
+                showModal('¡Registro Exitoso!', 'El nuevo administrador se ha registrado correctamente.');
+                document.getElementById('adminForm').reset();
+            }
+
+            localStorage.setItem('astoreeco_admins', JSON.stringify(adminsData));
+            renderAdmins();
+        }
+
+        function editStore(index) {
+            const store = storesData[index];
+            editingStoreIndex = index;
+
+            document.getElementById('storeName').value = store.name;
+            document.getElementById('storeRuc').value = store.ruc || '';
+            document.getElementById('storeCategory').value = store.category;
+            updateCategoryHint();
+            document.getElementById('storePhone').value = store.phone;
+            document.getElementById('storePin').value = store.pin;
+            document.getElementById('storeAddress').value = store.address;
+            document.getElementById('storeDesc').value = store.desc || '';
+            
+            currentLat = store.lat || null;
+            currentLng = store.lng || null;
+
+            if (currentLat && currentLng) {
+                if (marker) {
+                    marker.setLatLng([currentLat, currentLng]);
+                } else {
+                    marker = L.marker([currentLat, currentLng]).addTo(map);
+                }
+                if (map) map.setView([currentLat, currentLng], 15);
+            }
+
+            document.getElementById('storeFormTitle').innerText = "Editar Comercio / Productor";
+            document.getElementById('storeSubmitBtn').innerText = "Actualizar Tienda";
+            document.getElementById('cancelStoreEdit').classList.remove('hidden');
+
+            switchTab('store');
+        }
+
+        function resetStoreForm() {
+            editingStoreIndex = null;
+            document.getElementById('storeForm').reset();
+            document.getElementById('storeAddress').value = '';
+            updateCategoryHint();
+            document.getElementById('storeFormTitle').innerText = "Registrar Nuevo Comercio / Productor";
+            document.getElementById('storeSubmitBtn').innerText = "Guardar Tienda";
+            document.getElementById('cancelStoreEdit').classList.add('hidden');
+            if (marker) {
+                map.removeLayer(marker);
+                marker = null;
+            }
+            currentLat = null;
+            currentLng = null;
+        }
+
+        function editDriver(index) {
+            const driver = driversData[index];
+            editingDriverIndex = index;
+
+            document.getElementById('driverName').value = driver.name;
+            document.getElementById('driverDni').value = driver.dni;
+            document.getElementById('driverPhone').value = driver.phone;
+            document.getElementById('driverPin').value = driver.pin;
+            document.getElementById('driverVehicle').value = driver.vehicle;
+            document.getElementById('driverPlate').value = driver.plate || '';
+
+            document.getElementById('driverFormTitle').innerText = "Editar Repartidor";
+            document.getElementById('driverSubmitBtn').innerText = "Actualizar Repartidor";
+            document.getElementById('cancelDriverEdit').classList.remove('hidden');
+
+            switchTab('driver');
+        }
+
+        function resetDriverForm() {
+            editingDriverIndex = null;
+            document.getElementById('driverForm').reset();
+            document.getElementById('driverFormTitle').innerText = "Registrar Nuevo Repartidor";
+            document.getElementById('driverSubmitBtn').innerText = "Guardar Repartidor";
+            document.getElementById('cancelDriverEdit').classList.add('hidden');
+        }
+
+        function editAdmin(index) {
+            const admin = adminsData[index];
+            editingAdminIndex = index;
+
+            document.getElementById('adminName').value = admin.name;
+            document.getElementById('adminPhone').value = admin.phone;
+            document.getElementById('adminPin').value = admin.pin;
+            document.getElementById('adminRole').value = admin.role;
+
+            document.getElementById('adminFormTitle').innerText = "Editar Administrador";
+            document.getElementById('adminSubmitBtn').innerText = "Actualizar Administrador";
+            document.getElementById('cancelAdminEdit').classList.remove('hidden');
+        }
+
+        function resetAdminForm() {
+            editingAdminIndex = null;
+            document.getElementById('adminForm').reset();
+            document.getElementById('adminFormTitle').innerText = "Gestión de Administradores";
+            document.getElementById('adminSubmitBtn').innerText = "Registrar Administrador";
+            document.getElementById('cancelAdminEdit').classList.add('hidden');
+        }
+
+        function confirmDeleteStore(index) {
+            showModal('¿Eliminar Tienda?', `¿Estás seguro de eliminar "${storesData[index].name}"? Esta acción no se puede deshacer.`, true, `
+                <button onclick="closeModal()" class="flex-1 bg-gray-100 text-gray-700 font-bold py-2.5 px-3 rounded-xl hover:bg-gray-200 transition text-sm">Cancelar</button>
+                <button onclick="deleteStore(${index})" class="flex-1 bg-red-600 text-white font-bold py-2.5 px-3 rounded-xl hover:bg-red-700 transition text-sm shadow-md shadow-red-600/20">Sí, eliminar</button>
+            `);
+        }
+
+        function deleteStore(index) {
+            storesData.splice(index, 1);
+            localStorage.setItem('astoreeco_stores', JSON.stringify(storesData));
+            closeModal();
+            renderLists();
+        }
+
+        function confirmDeleteDriver(index) {
+            showModal('¿Eliminar Repartidor?', `¿Estás seguro de eliminar a "${driversData[index].name}"? Esta acción no se puede deshacer.`, true, `
+                <button onclick="closeModal()" class="flex-1 bg-gray-100 text-gray-700 font-bold py-2.5 px-3 rounded-xl hover:bg-gray-200 transition text-sm">Cancelar</button>
+                <button onclick="deleteDriver(${index})" class="flex-1 bg-red-600 text-white font-bold py-2.5 px-3 rounded-xl hover:bg-red-700 transition text-sm shadow-md shadow-red-600/20">Sí, eliminar</button>
+            `);
+        }
+
+        function deleteDriver(index) {
+            driversData.splice(index, 1);
+            localStorage.setItem('astoreeco_drivers', JSON.stringify(driversData));
+            closeModal();
+            renderLists();
+        }
+
+        function confirmDeleteAdmin(index) {
+            if (adminsData.length <= 1) {
+                showModal('Atención', 'Debe existir al menos un administrador en el sistema.', true);
+                return;
+            }
+            showModal('¿Eliminar Administrador?', `¿Estás seguro de eliminar a "${adminsData[index].name}"?`, true, `
+                <button onclick="closeModal()" class="flex-1 bg-gray-100 text-gray-700 font-bold py-2.5 px-3 rounded-xl hover:bg-gray-200 transition text-sm">Cancelar</button>
+                <button onclick="deleteAdmin(${index})" class="flex-1 bg-red-600 text-white font-bold py-2.5 px-3 rounded-xl hover:bg-red-700 transition text-sm shadow-md shadow-red-600/20">Sí, eliminar</button>
+            `);
+        }
+
+        function deleteAdmin(index) {
+            adminsData.splice(index, 1);
+            localStorage.setItem('astoreeco_admins', JSON.stringify(adminsData));
+            closeModal();
+            renderAdmins();
+        }
+
+        function confirmDeleteClient(index) {
+            showModal('¿Eliminar Cliente?', `¿Estás seguro de eliminar este registro de cliente?`, true, `
+                <button onclick="closeModal()" class="flex-1 bg-gray-100 text-gray-700 font-bold py-2.5 px-3 rounded-xl hover:bg-gray-200 transition text-sm">Cancelar</button>
+                <button onclick="deleteClient(${index})" class="flex-1 bg-red-600 text-white font-bold py-2.5 px-3 rounded-xl hover:bg-red-700 transition text-sm shadow-md shadow-red-600/20">Sí, eliminar</button>
+            `);
+        }
+
+        function deleteClient(index) {
+            clientsData.splice(index, 1);
+            localStorage.setItem('astoreeco_clients', JSON.stringify(clientsData));
+            closeModal();
+            renderClients();
+        }
+
+        function setFilter(cat) {
+            currentFilter = cat;
+            document.getElementById('filter-all').className = "px-4 py-2 text-xs font-bold rounded-xl transition " + (cat === 'all' ? "bg-emerald-700 text-white shadow-sm" : "bg-gray-100 text-gray-700 hover:bg-gray-200");
+            document.getElementById('filter-campo').className = "px-4 py-2 text-xs font-bold rounded-xl transition " + (cat === 'Campo' ? "bg-emerald-700 text-white shadow-sm" : "bg-gray-100 text-gray-700 hover:bg-gray-200");
+            document.getElementById('filter-ciudad').className = "px-4 py-2 text-xs font-bold rounded-xl transition " + (cat === 'Ciudad' ? "bg-emerald-700 text-white shadow-sm" : "bg-gray-100 text-gray-700 hover:bg-gray-200");
+            renderLists();
+        }
+
+        function toggleDetails(id) {
+            const el = document.getElementById(id);
+            el.classList.toggle('hidden');
+        }
+
+        function renderAdmins() {
+            adminsData = JSON.parse(localStorage.getItem('astoreeco_admins')) || [];
+            const listEl = document.getElementById('adminsAccordionList');
+
+            if (adminsData.length === 0) {
+                listEl.innerHTML = '<p class="text-center text-gray-500 py-6 text-sm">No hay administradores registrados.</p>';
+                return;
+            }
+
+            listEl.innerHTML = adminsData.map((a, idx) => `
+                <div class="border border-gray-200/80 rounded-2xl overflow-hidden bg-white shadow-sm transition hover:shadow p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
+                    <div>
+                        <div class="font-bold text-gray-900 flex items-center gap-2 text-sm">
+                            <span class="w-7 h-7 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-bold">🛡️</span>
+                            ${a.name}
+                            <span class="px-2.5 py-0.5 text-xs rounded-full bg-emerald-50 text-emerald-800 font-semibold border border-emerald-200/60">${a.role}</span>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1">Celular: <span class="text-emerald-700 font-semibold">+51 ${a.phone}</span> | PIN: <span class="font-mono bg-gray-100 px-1.5 py-0.5 rounded text-gray-700 font-bold">${a.pin}</span></p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="editAdmin(${idx})" class="bg-indigo-50 text-indigo-700 hover:bg-indigo-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Editar</button>
+                        <button onclick="confirmDeleteAdmin(${idx})" class="bg-red-50 text-red-600 hover:bg-red-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Eliminar</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderClients() {
+            clientsData = JSON.parse(localStorage.getItem('astoreeco_clients')) || JSON.parse(localStorage.getItem('astoreeco_users')) || [];
+            let ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            
+            document.getElementById('statTotalClients').innerText = clientsData.length;
+
+            const clientsList = document.getElementById('clientsAccordionList');
+            if (clientsData.length === 0) {
+                clientsList.innerHTML = '<p class="text-center text-gray-500 py-6 text-sm">No hay clientes registrados en el sistema actualmente.</p>';
+                return;
+            }
+
+            clientsList.innerHTML = clientsData.map((c, idx) => {
+                const clientPhone = c.phone || c.celular || '';
+                const clientOrders = ordersData.filter(o => o.clientPhone === clientPhone);
+                const totalSpent = clientOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+
+                return `
+                    <div class="border border-gray-200/80 rounded-2xl overflow-hidden bg-white shadow-sm transition hover:shadow">
+                        <button onclick="toggleDetails('client-details-${idx}')" class="w-full px-5 py-4 bg-gray-50/80 hover:bg-gray-100/80 flex justify-between items-center text-left focus:outline-none transition">
+                            <span class="font-bold text-gray-900 flex items-center gap-2.5 text-sm">
+                                <span class="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-bold shadow-inner">👤</span>
+                                +51 ${clientPhone} 
+                                <span class="px-2.5 py-1 text-xs rounded-full bg-indigo-50 text-indigo-800 font-semibold border border-indigo-200/60">${clientOrders.length} compras (S/ ${totalSpent.toFixed(2)})</span>
+                            </span>
+                            <span class="text-xs text-emerald-700 font-bold flex items-center gap-1 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200/60">Ver detalle ▾</span>
+                        </button>
+                        <div id="client-details-${idx}" class="hidden p-5 border-t border-gray-200/80 bg-white text-sm space-y-4">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 bg-gray-50/80 p-4 rounded-2xl border border-gray-200/60">
+                                <p class="text-xs"><strong>Dirección:</strong> <span class="text-gray-700">${c.address || c.direccion || 'No especificada'}</span></p>
+                                <p class="text-xs"><strong>Referencia:</strong> <span class="text-amber-700 font-medium">${c.reference || c.referencia || 'Sin referencia'}</span></p>
+                                <p class="text-xs"><strong>PIN de Acceso:</strong> <span class="font-mono bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-lg font-bold border border-emerald-200/60">${c.pin || '******'}</span></p>
+                            </div>
+
+                            <div>
+                                <h4 class="text-xs font-bold text-gray-700 uppercase tracking-wider mb-2.5 flex items-center gap-1.5">
+                                    <i class="fa-solid fa-bag-shopping text-emerald-600"></i> Historial de Compras (${clientOrders.length})
+                                </h4>
+                                ${clientOrders.length === 0 ? `
+                                    <p class="text-xs text-gray-500 italic py-2">Este cliente aún no ha registrado ninguna compra en la plataforma.</p>
+                                ` : `
+                                    <div class="space-y-2 max-h-64 overflow-y-auto pr-1">
+                                        ${clientOrders.map(o => `
+                                            <div class="border border-gray-200/80 rounded-xl p-3 bg-gray-50/50 flex flex-col md:flex-row justify-between items-start md:items-center gap-2 text-xs">
+                                                <div>
+                                                    <span class="font-bold text-emerald-700">${o.id}</span> • <span class="text-gray-500">${o.date || 'Reciente'}</span>
+                                                    <span class="block text-gray-600 mt-0.5 font-medium">Método de pago: ${o.paymentMethod || 'Contra entrega'}</span>
+                                                </div>
+                                                <div class="flex items-center gap-3">
+                                                    <span class="font-extrabold text-emerald-900 text-sm">S/ ${o.total ? o.total.toFixed(2) : '0.00'}</span>
+                                                    <span class="px-2.5 py-1 rounded-full font-bold text-[10px] ${o.status && o.status.includes('Entregado') ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}">${o.status || 'Pendiente'}</span>
+                                                </div>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                `}
+                            </div>
+
+                            <div class="pt-2 flex justify-end gap-2 border-t border-gray-100">
+                                <button onclick="confirmDeleteClient(${idx})" class="bg-red-50 text-red-600 hover:bg-red-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Eliminar Cliente</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // ===== CONTROL PRO / MÓDULOS POR TIENDA =====
+        const STORE_FEATURES_KEY = 'astoreeco_store_features';
+        const PRO_MODULES = [
+            {key:'restaurants', name:'Restaurantes', icon:'🍽️'},
+            {key:'hardware', name:'Ferretería', icon:'🔧'},
+            {key:'grocery', name:'Bodega', icon:'🏪'},
+            {key:'fashion', name:'Ropa', icon:'👕'},
+            {key:'pharmacy', name:'Farmacia', icon:'💊'},
+            {key:'technology', name:'Tecnología', icon:'📱'}
+        ];
+        function readStoreFeatures() { try { return JSON.parse(localStorage.getItem(STORE_FEATURES_KEY) || '{}') || {}; } catch(e) { return {}; } }
+        function writeStoreFeatures(data) { localStorage.setItem(STORE_FEATURES_KEY, JSON.stringify(data || {})); window.dispatchEvent(new StorageEvent('storage', {key: STORE_FEATURES_KEY})); }
+        function setProAccess(phone, field, value) {
+            const key=String(phone||'').trim(); if(!key)return;
+            const db=readStoreFeatures(); const cur=db[key]||{};
+            cur.pro={...(cur.pro||{}),[field]:!!value,updatedAt:new Date().toISOString()}; db[key]=cur; writeStoreFeatures(db); renderStoreFeatures();
+        }
+        function setProModule(phone, moduleKey, value) {
+            const key=String(phone||'').trim(); if(!key)return;
+            const db=readStoreFeatures(); const cur=db[key]||{};
+            cur.proModules={...(cur.proModules||{}),[moduleKey]:!!value};
+            // Mantiene compatibilidad con el módulo de restaurantes ya creado.
+            if(moduleKey==='restaurants'){ cur.restaurants={...(cur.restaurants||{}),enabled:!!value,paid:!!value}; }
+            db[key]=cur; writeStoreFeatures(db); renderStoreFeatures();
+        }
+        function renderStoreFeatures() {
+            const box=document.getElementById('storeFeaturesList'); if(!box)return;
+            const stores=JSON.parse(localStorage.getItem('astoreeco_stores')||'[]');
+            if(!stores.length){box.innerHTML='<p class="text-center text-gray-500 py-8 text-sm">No hay tiendas registradas.</p>';return;}
+            const db=readStoreFeatures();
+            box.innerHTML=stores.map(s=>{
+                const phone=String(s.phone||s.celular||'').trim(); const f=db[phone]||{}; const pro=f.pro||{}; const modules=f.proModules||{};
+                const active=pro.enabled===true && pro.paid===true;
+                const safePhone=phone.replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+                const moduleHtml=PRO_MODULES.map(m=>`<label class="flex items-center gap-2 px-3 py-2 bg-white border rounded-xl text-xs font-bold cursor-pointer"><input type="checkbox" ${modules[m.key]?'checked':''} ${active?'':'disabled'} onchange="setProModule('${safePhone}','${m.key}',this.checked)" class="w-4 h-4 accent-emerald-600"> ${m.icon} ${m.name}</label>`).join('');
+                return `<div class="border border-gray-200 rounded-2xl p-4 bg-gray-50/60"><div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4"><div><div class="font-black text-gray-900">${String(s.name||'Tienda')}</div><div class="text-xs text-gray-500 mt-1">📱 ${phone||'Sin celular'} ${s.ruc?' · RUC '+s.ruc:''}</div></div><div class="flex flex-col sm:flex-row gap-2"><label class="flex items-center gap-2 px-3 py-2 bg-white border rounded-xl text-xs font-bold cursor-pointer"><input type="checkbox" ${pro.paid?'checked':''} onchange="setProAccess('${safePhone}','paid',this.checked)" class="w-4 h-4 accent-emerald-600"> 💳 Pago PRO confirmado</label><label class="flex items-center gap-2 px-3 py-2 bg-white border rounded-xl text-xs font-bold cursor-pointer"><input type="checkbox" ${pro.enabled?'checked':''} onchange="setProAccess('${safePhone}','enabled',this.checked)" class="w-4 h-4 accent-emerald-600"> ⭐ Habilitar PRO</label></div></div><div class="mt-4"><div class="text-[11px] font-black uppercase tracking-wider text-gray-500 mb-2">Módulos PRO</div><div class="flex flex-wrap gap-2">${moduleHtml}</div></div><div class="mt-3 flex items-center justify-between"><span class="text-[11px] font-bold ${active?'text-emerald-700':'text-gray-500'}">${active?'● PRO ACTIVO — selecciona sus módulos':'○ PRO BLOQUEADO — confirma pago y habilita PRO'}</span><span class="text-[10px] text-gray-400">${PRO_MODULES.length} módulos disponibles</span></div></div>`;
+            }).join('');
+        }
+
+        function renderLists() {
+            storesData = JSON.parse(localStorage.getItem('astoreeco_stores')) || [];
+            driversData = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+            clientsData = JSON.parse(localStorage.getItem('astoreeco_clients')) || JSON.parse(localStorage.getItem('astoreeco_users')) || [];
+
+            document.getElementById('statTotalStores').innerText = storesData.length;
+            document.getElementById('statFieldStores').innerText = storesData.filter(s => s.category === 'Campo').length;
+            document.getElementById('statCityStores').innerText = storesData.filter(s => s.category === 'Ciudad').length;
+            document.getElementById('statTotalDrivers').innerText = driversData.length;
+            document.getElementById('statTotalClients').innerText = clientsData.length;
+
+            const searchVal = document.getElementById('searchInput').value.toLowerCase();
+
+            const storesList = document.getElementById('storesAccordionList');
+            const filteredStores = storesData.map((s, idx) => ({...s, originalIndex: idx})).filter(s => {
+                const matchesCat = (currentFilter === 'all' || s.category === currentFilter);
+                const matchesSearch = s.name.toLowerCase().includes(searchVal) || s.phone.includes(searchVal) || (s.ruc && s.ruc.includes(searchVal));
+                return matchesCat && matchesSearch;
+            });
+
+            if (filteredStores.length === 0) {
+                storesList.innerHTML = '<p class="text-center text-gray-500 py-6 text-sm">No se encontraron tiendas registradas.</p>';
+            } else {
+                storesList.innerHTML = filteredStores.map(s => `
+                    <div class="border border-gray-200/80 rounded-2xl overflow-hidden bg-white shadow-sm transition hover:shadow">
+                        <button onclick="toggleDetails('store-details-${s.originalIndex}')" class="w-full px-5 py-4 bg-gray-50/80 hover:bg-gray-100/80 flex justify-between items-center text-left focus:outline-none transition">
+                            <span class="font-bold text-gray-900 flex items-center gap-2.5 text-sm">
+                                <span class="w-8 h-8 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-bold shadow-inner">🌱</span>
+                                ${s.name} 
+                                <span class="px-2.5 py-1 text-xs rounded-full ${s.category === 'Campo' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'} font-semibold">${s.category}</span>
+                            </span>
+                            <span class="text-xs text-emerald-700 font-bold flex items-center gap-1 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200/60">Ver datos ▾</span>
+                        </button>
+                        <div id="store-details-${s.originalIndex}" class="hidden p-5 border-t border-gray-200/80 bg-white text-sm space-y-2.5">
+                            <p class="text-xs"><strong>RUC:</strong> <span class="font-mono bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-lg font-bold border border-emerald-200/60">${s.ruc || 'No registrado'}</span></p>
+                            <p class="text-xs"><strong>Modalidad / Entrega:</strong> <span class="text-emerald-700 font-semibold">${s.deliveryRule || (s.category === 'Campo' ? '1 día de anticipación' : 'Mismo día')}</span></p>
+                            <p class="text-xs"><strong>Celular (Login):</strong> <span class="text-emerald-700 font-semibold">+51 ${s.phone}</span></p>
+                            <p class="text-xs"><strong>PIN de Acceso:</strong> <span class="font-mono bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-lg font-bold border border-emerald-200/60">${s.pin}</span></p>
+                            <p class="text-xs"><strong>Dirección:</strong> <span class="text-gray-700">${s.address}</span></p>
+                            <p class="text-xs"><strong>Descripción:</strong> <span class="text-gray-600">${s.desc || 'Sin descripción'}</span></p>
+                            <div class="pt-3 flex justify-end gap-2 border-t border-gray-100">
+                                <button onclick="editStore(${s.originalIndex})" class="bg-indigo-50 text-indigo-700 hover:bg-indigo-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Editar</button>
+                                <button onclick="confirmDeleteStore(${s.originalIndex})" class="bg-red-50 text-red-600 hover:bg-red-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Eliminar</button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            const driversList = document.getElementById('driversAccordionList');
+            const filteredDrivers = driversData.map((d, idx) => ({...d, originalIndex: idx})).filter(d => {
+                return d.name.toLowerCase().includes(searchVal) || d.phone.includes(searchVal) || d.dni.includes(searchVal);
+            });
+
+            if (filteredDrivers.length === 0) {
+                driversList.innerHTML = '<p class="text-center text-gray-500 py-6 text-sm">No se encontraron repartidores registrados.</p>';
+            } else {
+                driversList.innerHTML = filteredDrivers.map(d => `
+                    <div class="border border-gray-200/80 rounded-2xl overflow-hidden bg-white shadow-sm transition hover:shadow">
+                        <button onclick="toggleDetails('driver-details-${d.originalIndex}')" class="w-full px-5 py-4 bg-gray-50/80 hover:bg-gray-100/80 flex justify-between items-center text-left focus:outline-none transition">
+                            <span class="font-bold text-gray-900 flex items-center gap-2.5 text-sm">
+                                <span class="w-8 h-8 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center text-xs font-bold shadow-inner">🛵</span>
+                                ${d.name} 
+                                <span class="px-2.5 py-1 text-xs rounded-full bg-purple-100 text-purple-800 font-semibold">${d.vehicle}</span>
+                            </span>
+                            <span class="text-xs text-emerald-700 font-bold flex items-center gap-1 bg-emerald-50 px-3 py-1.5 rounded-xl border border-emerald-200/60">Ver datos ▾</span>
+                        </button>
+                        <div id="driver-details-${d.originalIndex}" class="hidden p-5 border-t border-gray-200/80 bg-white text-sm space-y-2.5">
+                            <p class="text-xs"><strong>DNI:</strong> <span class="text-gray-700">${d.dni}</span></p>
+                            <p class="text-xs"><strong>Celular (Login):</strong> <span class="text-emerald-700 font-semibold">+51 ${d.phone}</span></p>
+                            <p class="text-xs"><strong>PIN de Acceso:</strong> <span class="font-mono bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-lg font-bold border border-emerald-200/60">${d.pin}</span></p>
+                            <p class="text-xs"><strong>Vehículo:</strong> <span class="text-gray-700">${d.vehicle} ${d.plate ? '('+d.plate+')' : ''}</span></p>
+                            <div class="pt-3 flex justify-end gap-2 border-t border-gray-100">
+                                <button onclick="editDriver(${d.originalIndex})" class="bg-indigo-50 text-indigo-700 hover:bg-indigo-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Editar</button>
+                                <button onclick="confirmDeleteDriver(${d.originalIndex})" class="bg-red-50 text-red-600 hover:bg-red-100 px-3.5 py-2 rounded-xl text-xs font-bold transition">Eliminar</button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function renderOrders() {
+            let ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const tbody = document.getElementById('ordersTableBody');
+            
+            if (ordersData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-gray-500 text-sm">No hay pedidos registrados en el sistema actualmente.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = ordersData.map((o, idx) => {
+                const deliv = o.deliveryDetails || {};
+                let badgeColor = "bg-amber-100 text-amber-800";
+                if(o.status && o.status.includes('ruta')) badgeColor = "bg-blue-100 text-blue-800";
+                if(o.status && o.status.includes('Entregado')) badgeColor = "bg-emerald-100 text-emerald-800";
+
+                return `
+                    <tr class="hover:bg-gray-50/80 transition">
+                        <td class="px-4 py-3.5">
+                            <span class="font-bold text-emerald-700">${o.id}</span>
+                            <span class="text-[10px] text-gray-400 block">${o.date || 'Reciente'}</span>
+                        </td>
+                        <td class="px-4 py-3.5">
+                            <strong class="text-gray-900 block">+51 ${o.clientPhone}</strong>
+                            <span class="text-xs text-gray-500">${deliv.address || 'Pucallpa'}</span>
+                            ${deliv.reference ? `<span class="text-[10px] text-amber-700 block font-medium">Ref: ${deliv.reference}</span>` : ''}
+                        </td>
+                        <td class="px-4 py-3.5 space-y-2">
+                            <div>
+                                <span class="font-extrabold text-emerald-800 text-sm">S/ ${o.total ? o.total.toFixed(2) : '0.00'}</span>
+                                <span class="text-[10px] text-gray-500 block">${o.paymentMethod || 'Contra entrega'}</span>
+                            </div>
+                            ${o.paymentReceipt ? `
+                                <div>
+                                    <button onclick="openImageModal('${o.paymentReceipt}')" class="text-[11px] text-emerald-700 font-bold underline flex items-center gap-1 bg-transparent border-0 cursor-pointer p-0">
+                                        <i class="fa-solid fa-receipt text-xs"></i> Ver voucher
+                                    </button>
+                                </div>
+                            ` : ''}
+                            ${o.deliveryPhoto ? `
+                                <div class="flex items-center gap-2 bg-emerald-50/80 p-1.5 rounded-xl border border-emerald-200/80 cursor-pointer hover:bg-emerald-100 transition" onclick="openImageModal('${o.deliveryPhoto}')">
+                                    <img src="${o.deliveryPhoto}" class="w-10 h-10 object-cover rounded-lg border border-emerald-400 shadow-sm flex-shrink-0">
+                                    <div>
+                                        <span class="text-[10px] font-bold text-emerald-950 block">Foto Entrega</span>
+                                        <span class="text-[10px] text-emerald-700 underline font-semibold">Ampliar</span>
+                                    </div>
+                                </div>
+                            ` : '<span class="text-[10px] text-gray-400 block">Sin foto</span>'}
+                        </td>
+                        <td class="px-4 py-3.5">
+                            <span class="px-3 py-1 text-xs rounded-full font-bold ${badgeColor}">${o.status || 'Pendiente'}</span>
+                        </td>
+                        <td class="px-4 py-3.5 text-center">
+                            <select onchange="updateOrderStatus('${o.id}', this.value)" class="text-xs border border-gray-300 rounded-xl p-2 bg-gray-50 font-semibold focus:ring-2 focus:ring-emerald-500">
+                                <option value="Cosecha programada (1 día ant.)" ${o.status==='Cosecha programada (1 día ant.)'?'selected':''}>Cosecha programada</option>
+                                <option value="En ruta de reparto" ${o.status==='En ruta de reparto'?'selected':''}>En ruta de reparto</option>
+                                <option value="Entregado en tu Mesa" ${o.status==='Entregado en tu Mesa'?'selected':''}>Entregado en tu Mesa</option>
+                            </select>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function updateOrderStatus(orderId, newStatus) {
+            let allOrders = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            const index = allOrders.findIndex(o => o.id === orderId);
+            if (index !== -1) {
+                allOrders[index].status = newStatus;
+                localStorage.setItem('astoreeco_orders', JSON.stringify(allOrders));
+                renderOrders();
+                renderAnalytics();
+                renderClients();
+                showModal('Actualizado', `El estado del pedido ${orderId} se ha sincronizado correctamente.`);
+            }
+        }
+
+        function renderAnalytics() {
+            let ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            
+            const totalOrders = ordersData.length;
+            const totalRevenue = ordersData.reduce((acc, o) => acc + (o.total || 0), 0);
+            const avgTicket = totalOrders > 0 ? (totalRevenue / totalOrders) : 0;
+
+            document.getElementById('analyticsTotalRevenue').innerText = `S/ ${totalRevenue.toFixed(2)}`;
+            document.getElementById('analyticsTotalOrders').innerText = totalOrders;
+            document.getElementById('analyticsAvgTicket').innerText = `S/ ${avgTicket.toFixed(2)}`;
+
+            let statusCounts = { 'Pendiente/Cosecha': 0, 'En ruta': 0, 'Entregado': 0 };
+            let paymentCounts = { 'Contra entrega': 0, 'Yape / Plin / Transferencia': 0 };
+
+            ordersData.forEach(o => {
+                if(o.status && o.status.includes('Entregado')) statusCounts['Entregado']++;
+                else if(o.status && o.status.includes('ruta')) statusCounts['En ruta']++;
+                else statusCounts['Pendiente/Cosecha']++;
+
+                if(o.paymentMethod && o.paymentMethod.toLowerCase().includes('contra')) {
+                    paymentCounts['Contra entrega']++;
+                } else {
+                    paymentCounts['Yape / Plin / Transferencia']++;
+                }
+            });
+
+            const ctxStatus = document.getElementById('ordersStatusChart').getContext('2d');
+            if(statusChartInstance) statusChartInstance.destroy();
+            statusChartInstance = new Chart(ctxStatus, {
+                type: 'doughnut',
+                data: {
+                    labels: Object.keys(statusCounts),
+                    datasets: [{
+                        data: Object.values(statusCounts),
+                        backgroundColor: ['#f59e0b', '#3b82f6', '#10b981'],
+                        borderWidth: 2,
+                        borderColor: '#ffffff'
+                    }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+            });
+
+            const ctxPay = document.getElementById('paymentMethodsChart').getContext('2d');
+            if(paymentChartInstance) paymentChartInstance.destroy();
+            paymentChartInstance = new Chart(ctxPay, {
+                type: 'bar',
+                data: {
+                    labels: Object.keys(paymentCounts),
+                    datasets: [{
+                        label: 'Nº Pedidos',
+                        data: Object.values(paymentCounts),
+                        backgroundColor: ['#10b981', '#6366f1'],
+                        borderRadius: 8
+                    }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }, plugins: { legend: { display: false } } }
+            });
+        }
+
+        function exportCSVReport() {
+            let ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            if(ordersData.length === 0) {
+                showModal('Atención', 'No hay datos de pedidos para exportar.', true);
+                return;
+            }
+
+            let csvContent = "data:text/csv;charset=utf-8,ID,Fecha,TelefonoCliente,Direccion,Total,MetodoPago,Estado\r\n";
+            ordersData.forEach(o => {
+                const deliv = o.deliveryDetails || {};
+                const row = [o.id, o.date || '', o.clientPhone, `"${deliv.address || ''}"`, o.total || 0, `"${o.paymentMethod || ''}"`, `"${o.status || ''}"`];
+                csvContent += row.join(",") + "\r\n";
+            });
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", `reporte_ventas_astoreeco_${new Date().toISOString().slice(0,10)}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        }
+
+        function initOrUpdateGPSMap() {
+            let drivers = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+            let liveLocations = JSON.parse(localStorage.getItem('astoreeco_driver_locations')) || {};
+
+            if (!gpsMap) {
+                gpsMap = L.map('gpsMap').setView([-8.3791, -74.5539], 13);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '&copy; OpenStreetMap contributors'
+                }).addTo(gpsMap);
+            } else {
+                setTimeout(() => { gpsMap.invalidateSize(); }, 100);
+            }
+
+            const statusListEl = document.getElementById('gpsStatusList');
+            if(drivers.length === 0) {
+                statusListEl.innerHTML = '<p class="text-xs text-gray-500 col-span-3 text-center py-6">No hay repartidores registrados en el sistema para rastrear.</p>';
+                return;
+            }
+
+            statusListEl.innerHTML = drivers.map(d => {
+                const loc = liveLocations[d.phone];
+                const hasGPS = loc && loc.lat && loc.lng;
+
+                if (hasGPS) {
+                    if (gpsMarkers[d.phone]) {
+                        gpsMarkers[d.phone].setLatLng([loc.lat, loc.lng]);
+                    } else {
+                        gpsMarkers[d.phone] = L.marker([loc.lat, loc.lng]).addTo(gpsMap)
+                            .bindPopup(`<b>🛵 ${d.name}</b><br>Vehículo: ${d.vehicle}<br>Celular: ${d.phone}`);
+                    }
+                }
+
+                return `
+                    <div class="border border-gray-200/80 rounded-2xl p-4 bg-gray-50/80 flex flex-col justify-between shadow-sm">
+                        <div>
+                            <span class="font-bold text-gray-900 block text-sm">🛵 ${d.name}</span>
+                            <span class="text-xs text-gray-500">Vehículo: ${d.vehicle} (${d.plate || 'Sin placa'})</span>
+                        </div>
+                        <div class="mt-3 pt-3 border-t border-gray-200/80 flex justify-between items-center text-xs">
+                            <span class="${hasGPS ? 'text-emerald-700 font-bold' : 'text-amber-600 font-medium'}">
+                                ${hasGPS ? '🟢 Con señal GPS activa' : '⚪ Sin reporte GPS aún'}
+                            </span>
+                            ${hasGPS ? `<button onclick="gpsMap.setView([${loc.lat},${loc.lng}], 16)" class="bg-emerald-600 text-white px-3 py-1.5 rounded-xl hover:bg-emerald-700 transition font-bold shadow-sm">Ver</button>` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function exportData() {
+            const backupObj = {
+                stores: storesData,
+                drivers: driversData,
+                clients: clientsData,
+                admins: adminsData,
+                orders: JSON.parse(localStorage.getItem('astoreeco_orders')) || [],
+                exportDate: new Date().toISOString()
+            };
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupObj, null, 2));
+            const downloadAnchor = document.createElement('a');
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", `astoreeco_backup_${new Date().toISOString().slice(0,10)}.json`);
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
+        }
+
+        function importData(event) {
+            const fileReader = new FileReader();
+            if (event.target.files[0]) {
+                fileReader.readAsText(event.target.files[0], "UTF-8");
+                fileReader.onload = function(e) {
+                    try {
+                        const imported = JSON.parse(e.target.result);
+                        if (imported.stores && imported.drivers) {
+                            localStorage.setItem('astoreeco_stores', JSON.stringify(imported.stores));
+                            localStorage.setItem('astoreeco_drivers', JSON.stringify(imported.drivers));
+                            if(imported.clients) localStorage.setItem('astoreeco_clients', JSON.stringify(imported.clients));
+                            if(imported.admins) {
+                                localStorage.setItem('astoreeco_admins', JSON.stringify(imported.admins));
+                                adminsData = imported.admins;
+                                renderAdmins();
+                            }
+                            if(imported.orders) localStorage.setItem('astoreeco_orders', JSON.stringify(imported.orders));
+                            
+                            storesData = imported.stores;
+                            driversData = imported.drivers;
+                            clientsData = imported.clients || [];
+                            
+                            renderLists();
+                            renderClients();
+                            showModal('¡Restauración Exitosa!', 'Los datos se han importado correctamente desde el archivo JSON.');
+                        } else {
+                            showModal('Error de Formato', 'El archivo JSON no tiene la estructura válida de ASTOREECO.', true);
+                        }
+                    } catch (err) {
+                        showModal('Error de Lectura', 'No se pudo procesar el archivo JSON.', true);
+                    }
+                };
+            }
+        }
+    </script>
+
+
+<script>
+/* ASTORE ECO SMART DELIVERY V1 */
+(function(){
+const OK='astoreeco_orders', SK='astoreeco_stores', DK='astoreeco_drivers';
+const R=k=>{try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}};
+const W=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+const N=v=>Number.isFinite(Number(v))?Number(v):null;
+function C(o){if(!o)return null;for(const p of [[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng],[o.clientLat,o.clientLng],[o.deliveryLat,o.deliveryLng]]){let a=N(p[0]),b=N(p[1]);if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b}}return null}
+function D(a,b){if(!a||!b)return Infinity;let r=6371,x=(b.lat-a.lat)*Math.PI/180,y=(b.lng-a.lng)*Math.PI/180,z=Math.sin(x/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(y/2)**2;return 2*r*Math.asin(Math.sqrt(z))}
+function build(o){
+ let stores=R(SK),groups={};
+ (Array.isArray(o.items)?o.items:[]).forEach(i=>{let k=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();(groups[k]??=[]).push(i)});
+ return Object.keys(groups).map((k,i)=>{let f=groups[k][0]||{},s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k),c=C(s);return{id:o.id+'-S'+(i+1),storeName:s?.name||f.storeName||'Tienda por confirmar',storePhone:s?.phone||f.storePhone||'',address:s?.address||f.storeAddress||'Ubicación no registrada',lat:c?.lat??null,lng:c?.lng??null,items:groups[k].map(x=>({name:x.name||x.product||'Producto',qty:Number(x.qty||x.quantity||1)})),status:'Pendiente',ready:false,pickedUp:false}});
+}
+function smart(o){if(!o?.id)return o;let stops=build(o);o.smartDelivery=o.smartDelivery||{};o.smartDelivery.version=1;o.smartDelivery.multiStore=stops.length>1;o.smartDelivery.stops=stops;o.smartDelivery.client={lat:N(o.clientLat),lng:N(o.clientLng),address:o.deliveryAddress||o.address||''};o.smartDelivery.updatedAt=new Date().toISOString();return o}
+function route(o,driver){
+ o=smart(o);let rem=(o.smartDelivery.stops||[]).map(x=>({...x})),missing=rem.filter(x=>x.lat==null||x.lng==null),valid=rem.filter(x=>x.lat!=null&&x.lng!=null),cur=C(driver)||{lat:-8.3791,lng:-74.5539},out=[];
+ while(valid.length){valid.sort((a,b)=>D(cur,{lat:a.lat,lng:a.lng})-D(cur,{lat:b.lat,lng:b.lng}));let n=valid.shift();n.distanceFromPreviousKm=+D(cur,{lat:n.lat,lng:n.lng}).toFixed(2);out.push(n);cur={lat:n.lat,lng:n.lng}}
+ let dest=C({lat:o.clientLat,lng:o.clientLng});if(dest){let prev=out.length?out[out.length-1]:cur;out.push({id:o.id+'-CLIENTE',storeName:'🏠 Cliente',address:o.smartDelivery.client.address,lat:dest.lat,lng:dest.lng,distanceFromPreviousKm:+D(prev,dest).toFixed(2),status:'Destino'});}o.smartDelivery.route=out.concat(missing);o.smartDelivery.status='Ruta calculada';return o
+}
+function save(o){let a=R(OK),i=a.findIndex(x=>String(x.id)===String(o.id));if(i>=0)a[i]=o;else a.unshift(o);W(OK,a);return o}
+function enrich(){let a=R(OK),ds=R(DK),ch=false;a.forEach(o=>{let old=JSON.stringify(o.smartDelivery),d=o.assignedDriver||ds.find(x=>x.phone===o.assignedDriver?.phone);route(o,d?.currentLocation||d);if(old!==JSON.stringify(o.smartDelivery))ch=true});if(ch)W(OK,a);return a}
+window.AstoreSmartDelivery={read:R,write:W,coords:C,distanceKm:D,smartify:smart,prepareOrder:(o,d)=>route(o,d),save,enrich,getOrder:id=>R(OK).find(o=>String(o.id)===String(id))||null,
+summary:o=>{let s=o?.smartDelivery||{},r=s.route||s.stops||[],a=r.filter(x=>x.storeName!=='🏠 Cliente'),kmTotal=r.reduce((q,x)=>q+(+x.distanceFromPreviousKm||0),0);return{stops:a,km:+kmTotal.toFixed(2),multi:!!s.multiStore}},
+stopsHTML:o=>(o?.smartDelivery?.route||o?.smartDelivery?.stops||[]).map((s,i)=>`<div class="flex gap-2 py-1.5"><span class="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-black">${s.storeName==='🏠 Cliente'?'🏠':i+1}</span><div class="min-w-0"><b class="text-[11px]">${s.storeName}</b><p class="text-[9px] text-gray-500 truncate">${s.address||''}</p><small class="text-[9px] text-emerald-700">${s.pickedUp?'Recogido':s.ready?'Listo':s.status||'Pendiente'}</small></div></div>`).join('')};
+document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>window.AstoreSmartDelivery.enrich(),150));
+})();
+</script>
+
+<script>
+(function(){
+function panel(){
+let nav=document.querySelector('nav');if(nav&&!document.getElementById('btn-smart')){let b=document.createElement('button');b.id='btn-smart';b.className='tab-btn flex items-center gap-2 py-2 px-3.5 font-semibold text-xs rounded-xl text-blue-700 bg-blue-50';b.innerHTML='<i class="fa-solid fa-route"></i> Smart Delivery';b.onclick=show;nav.appendChild(b)}
+if(document.getElementById('smart-panel'))return;let main=document.querySelector('main'),s=document.createElement('section');s.id='smart-panel';s.className='bg-white p-6 rounded-3xl shadow-sm border border-blue-200 hidden space-y-4';s.innerHTML='<div class="flex justify-between items-center"><div><p class="text-[10px] font-black uppercase text-blue-700">ASTORE ECO INTELIGENCIA LOGÍSTICA</p><h2 class="text-xl font-black">Smart Delivery</h2><p class="text-xs text-gray-500">Pedidos de varias tiendas, paradas y asignación de repartidor.</p></div><button onclick="refreshSmart()" class="bg-blue-600 text-white px-4 py-2 rounded-xl text-xs font-bold">Actualizar</button></div><div id="smart-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div><div id="smart-list" class="space-y-3"></div>';main.appendChild(s)}
+window.show=function(){panel();document.querySelectorAll('main>section').forEach(x=>x.classList.add('hidden'));document.getElementById('smart-panel').classList.remove('hidden');refreshSmart()}
+window.refreshSmart=async function(){
+let a=AstoreSmartDelivery.enrich(),m=a.filter(o=>o.smartDelivery?.multiStore),ds=AstoreSmartDelivery.read('astoreeco_drivers');
+for(const o of m){try{await AstoreEcoRoad.refreshSavedOrder(o)}catch(e){}}
+localStorage.setItem('astoreeco_orders',JSON.stringify(a));
+document.getElementById('smart-stats').innerHTML=[['Multitienda',m.length],['Activos',m.filter(o=>!String(o.status).toLowerCase().includes('entregado')).length],['Repartidores',ds.length],['Paradas',m.reduce((q,o)=>q+(o.smartDelivery?.stops||[]).filter(s=>!s.pickedUp).length,0)],['Margen delivery',`S/ ${m.reduce((q,o)=>q+Number(o.astorEcoDeliveryMargin||0),0).toFixed(2)}`]].map(x=>'<div class="bg-gray-50 border rounded-2xl p-3"><p class="text-[10px] text-gray-500">'+x[0]+'</p><b class="text-xl">'+x[1]+'</b></div>').join('');
+let box=document.getElementById('smart-list');if(!m.length){box.innerHTML='<p class="text-sm text-gray-400 text-center py-8">No hay pedidos multitienda todavía.</p>';return}
+box.innerHTML=m.map(o=>{let km=Number(o.deliveryKm||o.smartDelivery?.routeDistanceKm||0);return '<div class="border rounded-3xl p-4"><div class="flex justify-between"><b class="text-sm text-emerald-700">'+o.id+'</b><span class="text-[9px] bg-blue-50 text-blue-700 px-2 py-1 rounded-full">'+(o.status||'Pendiente')+'</span></div><p class="text-[10px] text-gray-500 mt-1">'+(o.clientName||'Cliente')+' · '+(o.deliveryAddress||o.address||'')+'</p><div class="bg-gray-50 rounded-2xl p-3 mt-2">'+AstoreSmartDelivery.stopsHTML(o)+'</div><p class="text-[9px] text-gray-500 mt-2">🛣️ '+km.toFixed(2)+' km por calles · ⏱️ '+Number(o.deliveryMinutes||0)+' min</p><div class="mt-3 grid grid-cols-3 gap-2 text-center"><div class="bg-blue-50 rounded-xl p-2"><small class="text-[8px] text-blue-700">Cliente</small><b class="block text-xs">S/ '+Number(o.deliveryFee||0).toFixed(2)+'</b></div><div class="bg-amber-50 rounded-xl p-2"><small class="text-[8px] text-amber-700">Repartidor</small><b class="block text-xs">S/ '+Number(o.driverPayout||0).toFixed(2)+'</b></div><div class="bg-emerald-50 rounded-xl p-2"><small class="text-[8px] text-emerald-700">ASTORE</small><b class="block text-xs">S/ '+Number(o.astorEcoDeliveryMargin||0).toFixed(2)+'</b></div></div></div>'}).join('')
+}
+document.addEventListener('DOMContentLoaded',()=>setTimeout(panel,250));window.addEventListener('storage',e=>{if(e.key==='astoreeco_orders')setTimeout(()=>{if(document.getElementById('smart-panel')&&!document.getElementById('smart-panel').classList.contains('hidden'))refreshSmart()},100)})
+})();
+</script>
+
+<script>
+/* ASTORE ECO SMART DELIVERY PRICING V2 */
+(function(){
+  const STORE_KEY='astoreeco_stores';
+  function read(k){try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}}
+  function num(v){const n=Number(v);return Number.isFinite(n)?n:null}
+  function coord(o){if(!o)return null; const pairs=[[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng]]; for(const p of pairs){const a=num(p[0]),b=num(p[1]);if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b}} return null}
+  function km(a,b){if(!a||!b)return 0;const R=6371,dLat=(b.lat-a.lat)*Math.PI/180,dLng=(b.lng-a.lng)*Math.PI/180;const q=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;return 2*R*Math.asin(Math.sqrt(q))}
+  function storesFor(items){
+    const stores=read(STORE_KEY), groups={};
+    (Array.isArray(items)?items:[]).forEach(i=>{const key=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();(groups[key]??=[]).push(i)});
+    return Object.keys(groups).map(k=>{const f=groups[k][0]||{},s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k);return {name:s?.name||f.storeName||'Tienda por confirmar',phone:s?.phone||f.storePhone||'',coord:coord(s)}});
+  }
+  function routeKm(items,client){
+    const pts=storesFor(items).map(x=>x.coord).filter(Boolean);
+    if(!pts.length)return 0;
+    let remaining=pts.slice(), cur=remaining.shift(), total=0;
+    while(remaining.length){remaining.sort((a,b)=>km(cur,a)-km(cur,b));const n=remaining.shift();total+=km(cur,n);cur=n}
+    if(client) total+=km(cur,client);
+    return total;
+  }
+  function round2(n){return Math.round(n*100)/100}
+  function calculate(items,clientLat,clientLng){
+    const client=(num(clientLat)!==null&&num(clientLng)!==null)?{lat:num(clientLat),lng:num(clientLng)}:null;
+    const stores=storesFor(items);
+    const count=stores.length;
+    if(!items?.length)return {fee:0,driverPayout:0,platformMargin:0,km:0,stores:0,extraStoreFee:0};
+    const route=routeKm(items,client);
+    let fee=route<=2?5:route<=4?6:route<=6?7:route<=8?9:10+Math.ceil(route-8)*1.5;
+    const extraStoreFee=Math.min(3,Math.max(0,count-1));
+    fee+=extraStoreFee;
+    fee=Math.max(5,Math.round(fee));
+    const driverPayout=Math.max(4,Math.round(fee*0.75));
+    const platformMargin=round2(fee-driverPayout);
+    return {fee,driverPayout,platformMargin,km:round2(route),stores:count,extraStoreFee};
+  }
+  window.AstoreEcoPricing={calculate};
+})();
+</script>
+
+<script>
+/* ASTORE ECO SMART DELIVERY V3 — RUTAS POR CALLES REALES
+   Usa OSRM para obtener distancia y recorrido sobre la red vial.
+   Si el servicio no responde, conserva el cálculo geográfico anterior como respaldo.
+*/
+(function(){
+  const STORE_KEY='astoreeco_stores', ORDERS_KEY='astoreeco_orders', DRIVERS_KEY='astoreeco_drivers';
+  const OSRM='https://router.project-osrm.org';
+
+  const read=k=>{try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}};
+  const num=v=>Number.isFinite(Number(v))?Number(v):null;
+  const coord=o=>{
+    if(!o)return null;
+    for(const p of [[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng],[o.clientLat,o.clientLng]]){
+      const a=num(p[0]),b=num(p[1]);
+      if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b};
+    }
+    return null;
+  };
+  const geoKm=(a,b)=>{
+    if(!a||!b)return 0;
+    const R=6371,dLat=(b.lat-a.lat)*Math.PI/180,dLng=(b.lng-a.lng)*Math.PI/180;
+    const q=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+    return 2*R*Math.asin(Math.sqrt(q));
+  };
+  const storesFor=items=>{
+    const stores=read(STORE_KEY),groups={};
+    (Array.isArray(items)?items:[]).forEach(i=>{
+      const key=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();
+      (groups[key]??=[]).push(i);
+    });
+    return Object.keys(groups).map(k=>{
+      const f=groups[k][0]||{};
+      const s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k);
+      return {
+        name:s?.name||f.storeName||'Tienda por confirmar',
+        phone:s?.phone||f.storePhone||'',
+        address:s?.address||f.storeAddress||'Ubicación no registrada',
+        coord:coord(s)
+      };
+    });
+  };
+
+  async function osrmTrip(points){
+    if(!points || points.length<2) return null;
+    const valid=points.filter(Boolean);
+    if(valid.length<2)return null;
+    const coords=valid.map(p=>`${p.lng},${p.lat}`).join(';');
+    const url=`${OSRM}/trip/v1/driving/${coords}?source=first&destination=last&roundtrip=false&overview=full&steps=true`;
+    const r=await fetch(url,{headers:{'Accept':'application/json'}});
+    if(!r.ok)throw new Error('OSRM '+r.status);
+    const data=await r.json();
+    if(data.code!=='Ok'||!data.trips?.[0])throw new Error('OSRM sin ruta');
+    return data;
+  }
+
+  async function roadRoute(points){
+    try{
+      const data=await osrmTrip(points);
+      const trip=data.trips[0];
+      const order=(data.waypoints||[]).map((w,i)=>({idx:i,waypoint_index:w.waypoint_index,location:w.location})).sort((a,b)=>a.waypoint_index-b.waypoint_index);
+      return {
+        ok:true,
+        km:+(trip.distance/1000).toFixed(2),
+        minutes:Math.ceil(trip.duration/60),
+        geometry:trip.geometry||null,
+        order
+      };
+    }catch(e){
+      let total=0;
+      for(let i=1;i<points.length;i++)total+=geoKm(points[i-1],points[i]);
+      return {ok:false,km:+total.toFixed(2),minutes:Math.ceil(total/0.35),geometry:null,error:String(e?.message||e)};
+    }
+  }
+
+  function feeFor(km,stores){
+    let fee=km<=2?5:km<=4?6:km<=6?7:km<=8?9:10+Math.ceil(km-8)*1.5;
+    const extra=Math.min(3,Math.max(0,(stores||1)-1));
+    fee=Math.max(5,Math.round(fee+extra));
+    const driver=Math.max(4,Math.round(fee*.75));
+    return {fee,driverPayout:driver,platformMargin:+(fee-driver).toFixed(2),extraStoreFee:extra};
+  }
+
+  async function calculateRoad(items,client,start=null){
+    const stores=storesFor(items);
+    const storePoints=stores.map(s=>s.coord).filter(Boolean);
+    let points=[];
+    if(start)points.push(start);
+    points=points.concat(storePoints);
+    if(client)points.push(client);
+    if(points.length<2){
+      const fallback=feeFor(0,stores.length);
+      return {...fallback,km:0,minutes:0,stores:stores.length,roadBased:false,reason:'Faltan coordenadas'};
+    }
+    const rr=await roadRoute(points);
+    const f=feeFor(rr.km,stores.length);
+    return {...f,km:rr.km,minutes:rr.minutes,stores:stores.length,roadBased:rr.ok,geometry:rr.geometry||null};
+  }
+
+  async function prepareOrderRoad(order,driverLocation=null){
+    if(!order?.id)return order;
+    const stores=storesFor(order.items||[]);
+    const client=coord({lat:order.clientLat,lng:order.clientLng});
+    const start=coord(driverLocation);
+    const points=[];
+    if(start)points.push(start);
+    stores.filter(s=>s.coord).forEach(s=>points.push(s.coord));
+    if(client)points.push(client);
+
+    let rr=null;
+    if(points.length>=2)rr=await roadRoute(points);
+
+    order.smartDelivery=order.smartDelivery||{};
+    order.smartDelivery.version=3;
+    order.smartDelivery.roadBased=!!rr?.ok;
+    order.smartDelivery.routeDistanceKm=rr?.km||0;
+    order.smartDelivery.etaMinutes=rr?.minutes||0;
+    order.smartDelivery.roadGeometry=rr?.geometry||null;
+    order.smartDelivery.updatedAt=new Date().toISOString();
+
+    const routeStops=stores.filter(s=>s.coord).map((s,i)=>({
+      id:order.id+'-S'+(i+1),storeName:s.name,storePhone:s.phone,address:s.address,
+      lat:s.coord.lat,lng:s.coord.lng,status:'Pendiente',ready:false,pickedUp:false
+    }));
+    if(client)routeStops.push({
+      id:order.id+'-CLIENTE',storeName:'🏠 Cliente',
+      address:order.deliveryAddress||order.address||'',lat:client.lat,lng:client.lng,status:'Destino'
+    });
+    order.smartDelivery.stops=routeStops;
+    order.smartDelivery.multiStore=stores.length>1;
+
+    const pricing=await calculateRoad(order.items||[],client,start);
+    order.deliveryFee=pricing.fee;
+    order.deliveryKm=pricing.km;
+    order.deliveryMinutes=pricing.minutes;
+    order.deliveryStoreCount=pricing.stores;
+    order.driverPayout=pricing.driverPayout;
+    order.astorEcoDeliveryMargin=pricing.platformMargin;
+    order.deliveryRoadBased=pricing.roadBased;
+    return order;
+  }
+
+  async function refreshSavedOrder(order){
+    const ds=read(DRIVERS_KEY);
+    const d=order?.assignedDriver?.phone ? ds.find(x=>String(x.phone)===String(order.assignedDriver.phone)) : null;
+    return prepareOrderRoad(order,d?.currentLocation||null);
+  }
+
+  window.AstoreEcoRoad={
+    read,coord,storesFor,geoKm,roadRoute,calculateRoad,prepareOrderRoad,refreshSavedOrder
+  };
+})();
+</script>
+
+
+<section id="astoreEcoRoutingCentral" style="margin:18px 0;padding:18px;border-radius:18px;background:#111;color:#fff">
+  <div style="font-weight:800;font-size:20px">🧠 ASTORE ECO ROUTING</div>
+  <div style="opacity:.8;margin-top:4px">Motor logístico centralizado · V1</div>
+  <div id="astoreEcoRoutingCentralBody" style="margin-top:14px">Cargando rutas…</div>
+</section>
+<script>
+(function(){
+  function read(k,d){try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}}
+  function render(){
+    const box=document.getElementById('astoreEcoRoutingCentralBody'); if(!box)return;
+    const data=read('astoreeco_routing_engine_v1',{routes:{}}), routes=Object.values(data.routes||{});
+    if(!routes.length){box.innerHTML='<div style="opacity:.75">Aún no hay rutas centralizadas generadas.</div>';return;}
+    box.innerHTML=routes.slice(-10).reverse().map(r=>`
+      <div style="padding:14px;margin:8px 0;border-radius:14px;background:#1d1d1d">
+        <b>${r.orderId||'Pedido'}</b><br>
+        📍 ${r.stopCount||0} tienda(s) · ${r.distanceKm||0} km · ⏱️ ${r.etaMinutes||0} min
+        <div style="margin-top:6px;opacity:.8">${(r.stops||[]).map((s,i)=>(i+1)+'. '+s.name).join(' → ')}${r.destination?' → Cliente':''}</div>
+      </div>`).join('');
+  }
+  render(); setInterval(render,5000);
+})();
+</script>
+
+
+<section id="astoreEcoRoutingV2" style="margin:18px 0;padding:18px;border-radius:20px;background:#0b1220;color:#fff">
+  <div style="font-size:21px;font-weight:900">🧠 ASTORE ECO ROUTING V2</div>
+  <div style="opacity:.78;margin:4px 0 14px">Servicio central de rutas · asignación · paradas · economía</div>
+  <div id="aeV2Stats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+  <div id="aeV2Routes" style="margin-top:12px"></div>
+</section>
+<script>
+(function(){
+  const box=document.getElementById('aeV2Routes'), stats=document.getElementById('aeV2Stats');
+  const read=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
+  function render(){
+    if(!box)return;
+    const routes=window.AstoreEcoRoutingV2.listRoutes().slice().reverse();
+    const state=read('astoreeco_routing_v2_state',{requests:0,routesCreated:0});
+    stats.innerHTML=[
+      ['Solicitudes',state.requests||0],
+      ['Rutas creadas',state.routesCreated||0],
+      ['Activas',routes.filter(r=>!['entregada','cancelada'].includes(r.status)).length]
+    ].map(x=>`<div style="padding:12px;border-radius:14px;background:#182235"><small>${x[0]}</small><div style="font-size:22px;font-weight:900">${x[1]}</div></div>`).join('');
+    box.innerHTML=routes.slice(0,12).map(r=>`
+      <div style="padding:13px;margin:8px 0;border-radius:14px;background:#151f31">
+        <b>${r.routeId||r.orderId}</b> · ${r.status||'planificada'}<br>
+        📍 ${r.stops?.length||0} tiendas · ${r.distanceKm||0} km · ⏱️ ${r.etaMinutes||0} min<br>
+        💰 Delivery S/${r.deliveryFee||0} · Repartidor S/${r.driverPayout||0} · ASTORE S/${r.astorEcoMargin||0}
+        <div style="opacity:.78;margin-top:5px">${(r.stops||[]).map(s=>s.sequence+'. '+s.name).join(' → ')}${r.destination?' → Cliente':''}</div>
+      </div>`).join('') || '<div style="opacity:.7">No hay rutas creadas todavía.</div>';
+  }
+  render();setInterval(render,4000);
+})();
+</script>
+
+</body>
+</html>

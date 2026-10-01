@@ -1,0 +1,2047 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASTOREECO - Catálogo y Accesos Unificados</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+
+
+
+<script>
+/* ASTORE ECO ROUTING V2 — SERVICIO CENTRAL DE RUTAS
+   API interna desacoplada: clientes -> servicio -> rutas.
+   Persistencia:
+   - astoreeco_routing_v2_state
+   - astoreeco_routing_v2_routes
+*/
+(function(){
+  const STATE='astoreeco_routing_v2_state';
+  const ROUTES='astoreeco_routing_v2_routes';
+  const ORDERS='astoreeco_orders';
+  const STORES='astoreeco_stores';
+  const DRIVERS='astoreeco_drivers';
+
+  const read=(k,d)=>{try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}};
+  const write=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+  const n=v=>Number.isFinite(Number(v))?Number(v):null;
+  const now=()=>new Date().toISOString();
+
+  function point(x){
+    if(!x)return null;
+    const lat=n(x.lat??x.latitude), lng=n(x.lng??x.lon??x.longitude);
+    return lat!==null&&lng!==null?{lat,lng}:null;
+  }
+  function hav(a,b){
+    if(!a||!b)return 999999;
+    const R=6371,p=Math.PI/180,d1=(b.lat-a.lat)*p,d2=(b.lng-a.lng)*p;
+    const q=Math.sin(d1/2)**2+Math.cos(a.lat*p)*Math.cos(b.lat*p)*Math.sin(d2/2)**2;
+    return 2*R*Math.asin(Math.sqrt(q));
+  }
+  function allStores(){
+    return read(STORES,[]).map((s,i)=>({...s,_i:i,_p:point(s)}));
+  }
+  function stops(order){
+    const ss=allStores(), g={};
+    (order.items||[]).forEach(it=>{
+      const key=String(it.storeId||it.storePhone||it.storeName||'SIN_TIENDA');
+      if(!g[key])g[key]={key,name:it.storeName||'Tienda',phone:it.storePhone||'',items:[]};
+      g[key].items.push(it);
+    });
+    return Object.values(g).map((x,i)=>{
+      const s=ss.find(z=>(x.phone&&String(z.phone)===String(x.phone)) ||
+                          (x.name&&String(z.name).toLowerCase()===String(x.name).toLowerCase()));
+      return {id:'stop-'+i,key:x.key,name:x.name,phone:x.phone,items:x.items,
+              location:s?s._p:null,store:s||null,status:'pendiente'};
+    });
+  }
+  function destination(order){
+    return point({lat:order.clientLat??order.deliveryLat,lng:order.clientLng??order.deliveryLng});
+  }
+
+  // Simple central optimizer. If a real road-router API is configured later,
+  // replace this function while preserving the returned contract.
+  function optimize(stops,start,end){
+    const pending=stops.filter(s=>s.location).slice();
+    let cur=start||pending[0]?.location||end, km=0, out=[];
+    while(pending.length){
+      let bi=0,bd=Infinity;
+      pending.forEach((s,i)=>{const d=hav(cur,s.location);if(d<bd){bd=d;bi=i;}});
+      const s=pending.splice(bi,1)[0];
+      km+=hav(cur,s.location);cur=s.location;out.push(s);
+    }
+    if(end)km+=hav(cur,end);
+    return {stops:out,km};
+  }
+
+  function fee(km,count){
+    let base=km<=2?5:km<=4?6:km<=6?7:km<=8?9:9+Math.ceil(km-8)*1.25;
+    base=Math.round(base*2)/2;
+    const extra=Math.min(Math.max(count-1,0)*1.5,4.5);
+    const total=Math.max(5,base+extra);
+    const driver=Math.max(4,Math.round(total*.75*2)/2);
+    return {deliveryFee:Number(total.toFixed(2)),driverPayout:Number(driver.toFixed(2)),
+            astorEcoMargin:Number((total-driver).toFixed(2))};
+  }
+
+  function build(order,driver){
+    const end=destination(order);
+    const ds=point(driver?.currentLocation);
+    const ss=stops(order);
+    const r=optimize(ss,ds,end);
+    const minutes=Math.max(5,Math.round(r.km/.32));
+    const econ=fee(r.km,r.stops.length);
+    return {
+      routeId:'AE-RV2-'+String(order.id||Date.now()),
+      orderId:order.id,
+      version:2,
+      engine:'ASTORE ECO ROUTING V2',
+      createdAt:now(),updatedAt:now(),
+      status:'planificada',
+      driverId:driver?.id||driver?.phone||null,
+      start:ds||null,
+      stops:r.stops.map((s,i)=>({
+        id:s.id,sequence:i+1,name:s.name,phone:s.phone,location:s.location,
+        itemCount:s.items.reduce((a,x)=>a+Number(x.quantity||1),0),
+        status:'pendiente'
+      })),
+      destination:end,
+      distanceKm:Number(r.km.toFixed(2)),
+      etaMinutes:minutes,
+      ...econ,
+      roadBased:false,
+      navigationProvider:'ASTORE ECO ROUTING',
+      notes:'V2 centralizada. El motor de calles reales puede conectarse al backend sin cambiar esta API.'
+    };
+  }
+
+  function save(order,driver){
+    const route=build(order,driver), db=read(ROUTES,{});
+    route.updatedAt=now(); db[order.id]=route; write(ROUTES,db);
+    const state=read(STATE,{requests:0,routesCreated:0,lastRequestAt:null});
+    state.requests=(state.requests||0)+1; state.routesCreated=(state.routesCreated||0)+1; state.lastRequestAt=now();
+    write(STATE,state); return route;
+  }
+  function get(orderId){return read(ROUTES,{})[orderId]||null;}
+  function assign(orderId,driver){
+    const db=read(ROUTES,{}), r=db[orderId]; if(!r)return null;
+    r.driverId=driver?.id||driver?.phone||null;r.status='asignada';r.updatedAt=now();
+    write(ROUTES,db);return r;
+  }
+  function setStopStatus(orderId,stopId,status){
+    const db=read(ROUTES,{}),r=db[orderId];if(!r)return null;
+    const s=r.stops.find(x=>x.id===stopId);if(!s)return r;
+    s.status=status;r.updatedAt=now();
+    if(r.stops.length && r.stops.every(x=>x.status==='recogido'||x.status==='entregado'))r.status='en_entrega';
+    write(ROUTES,db);return r;
+  }
+  function setStatus(orderId,status){
+    const db=read(ROUTES,{}),r=db[orderId];if(!r)return null;
+    r.status=status;r.updatedAt=now();write(ROUTES,db);return r;
+  }
+  function list(){return Object.values(read(ROUTES,{}));}
+
+  window.AstoreEcoRoutingV2={
+    apiVersion:'2.0',
+    createRoute:save,getRoute:get,assignDriver:assign,
+    updateStop:setStopStatus,updateStatus:setStatus,
+    listRoutes:list,calculate:build
+  };
+})();
+</script>
+
+
+<script>
+/* ASTORE ECO ROUTING V3 — BRIDGE
+   Sincroniza el ecosistema con el backend central.
+*/
+(function(){
+  const DEFAULT=(location.protocol.startsWith('http') ? location.origin : 'http://localhost:8080');
+  const API=localStorage.getItem('ASTORE_ECO_API_URL')||DEFAULT;
+  const key='astoreeco_orders';
+  let busy=false;
+
+  async function request(path, options){
+    const r=await fetch(API+path,{headers:{'Content-Type':'application/json',...(options&&options.headers||{})},...(options||{})});
+    if(!r.ok) throw new Error('API '+r.status);
+    return r.json();
+  }
+
+  async function syncLocalOrders(){
+    if(busy)return; busy=true;
+    try{
+      const local=JSON.parse(localStorage.getItem(key)||'[]');
+      if(Array.isArray(local)&&local.length) await request('/api/orders/sync',{method:'POST',body:JSON.stringify({orders:local})});
+      const remote=await request('/api/orders');
+      const map=new Map();
+      [...local,...(remote.orders||[])].forEach(o=>{if(o?.id)map.set(o.id,o)});
+      const merged=[...map.values()];
+      if(JSON.stringify(merged)!==JSON.stringify(local)) localStorage.setItem(key,JSON.stringify(merged));
+    }catch(e){ console.warn('ASTORE ECO backend no disponible:',e.message); }
+    finally{busy=false;}
+  }
+
+  async function syncStoresAndDrivers(){
+    try{
+      const stores=JSON.parse(localStorage.getItem('astoreeco_stores')||'[]');
+      if(stores.length) await request('/api/stores/sync',{method:'POST',body:JSON.stringify({stores})});
+      const drivers=JSON.parse(localStorage.getItem('astoreeco_drivers')||'[]');
+      if(drivers.length) await request('/api/drivers/sync',{method:'POST',body:JSON.stringify({drivers})});
+    }catch(e){}
+  }
+
+  async function refreshRouteForLatest(){
+    try{
+      const orders=JSON.parse(localStorage.getItem(key)||'[]');
+      const latest=orders[orders.length-1];
+      if(!latest?.id)return;
+      const existing=await fetch(API+'/api/routes/'+encodeURIComponent(latest.id));
+      if(!existing.ok){
+        await request('/api/routes/create',{method:'POST',body:JSON.stringify({order:latest})});
+      }
+    }catch(e){}
+  }
+
+  window.AstoreEcoBackendV3={API,syncLocalOrders,syncStoresAndDrivers,refreshRouteForLatest};
+  function start(){syncStoresAndDrivers();syncLocalOrders();refreshRouteForLatest();setInterval(syncLocalOrders,5000);setInterval(syncStoresAndDrivers,10000);}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start);else start();
+})();
+</script>
+
+</head>
+<body id="mainBody" class="bg-gray-50 font-sans min-h-screen flex flex-col justify-between transition-colors duration-300">
+
+    <!-- Header General -->
+    <header class="bg-emerald-700 text-white shadow-md">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold flex items-center gap-2">
+                <span>🌱 ASTOREECO - Pucallpa</span>
+            </h1>
+            <div id="headerUserBox" class="hidden items-center gap-3">
+                <button onclick="toggleSolarMode()" id="solarModeBtn" class="text-xs bg-emerald-800 hover:bg-emerald-900 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 shadow-sm">
+                    <i class="fa-solid fa-sun"></i> <span id="solarModeText">Modo Sol</span>
+                </button>
+                <span id="headerUserName" class="text-sm bg-emerald-800 px-3 py-1 rounded-full font-medium"></span>
+                <button onclick="logout()" class="text-xs bg-red-600 hover:bg-red-700 px-3 py-1.5 rounded-md font-semibold transition">Cerrar Sesión</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="max-w-6xl mx-auto px-4 py-8 w-full flex-grow flex items-center justify-center">
+
+        <!-- VISTA DE LOGIN -->
+        <div id="view-login" class="bg-white/95 backdrop-blur-xl rounded-[2.5rem] p-8 md:p-10 max-w-md w-full shadow-2xl border border-gray-100 my-6 space-y-7">
+            <div class="text-center space-y-3">
+                <div class="w-16 h-16 bg-gradient-to-tr from-emerald-600 to-emerald-500 text-white rounded-2xl flex items-center justify-center mx-auto text-2xl font-bold shadow-lg shadow-emerald-600/30">
+                    <i class="fa-solid fa-seedling"></i>
+                </div>
+                <div>
+                    <h2 class="text-2xl font-black tracking-wide text-gray-900">ASTORE ECO</h2>
+                    <p class="text-xs font-medium text-emerald-700 mt-1 uppercase tracking-wider">Acceso Unificado Inteligente</p>
+                </div>
+            </div>
+
+            <form onsubmit="handleUnifiedLogin(event)" class="space-y-5">
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-2">
+                        <i class="fa-solid fa-id-card text-emerald-600"></i> RUC, DNI o Celular
+                    </label>
+                    <input type="text" id="loginIdentifier" required placeholder="Ej. 987654321" class="w-full px-4 py-3.5 text-sm rounded-2xl border border-gray-300 shadow-sm focus:ring-2 focus:ring-emerald-500 bg-gray-50/50 transition font-medium">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2 flex items-center gap-2">
+                        <i class="fa-solid fa-lock text-emerald-600"></i> PIN de Acceso (6 dígitos)
+                    </label>
+                    <input type="password" id="loginPin" maxlength="6" pattern="[0-9]{6}" required placeholder="••••••" class="w-full px-4 py-3.5 text-sm rounded-2xl border border-gray-300 shadow-sm focus:ring-2 focus:ring-emerald-500 bg-gray-50/50 font-mono tracking-widest transition text-center text-lg">
+                </div>
+
+                <button type="submit" class="w-full bg-gradient-to-r from-emerald-600 to-emerald-700 text-white font-extrabold py-4 px-4 rounded-2xl hover:from-emerald-700 hover:to-emerald-800 transition shadow-lg shadow-emerald-600/25 text-sm flex items-center justify-center gap-2 group">
+                    <span>Ingresar al Sistema</span>
+                    <i class="fa-solid fa-arrow-right-to-bracket transition group-hover:translate-x-1"></i>
+                </button>
+                <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                    <p class="text-[11px] font-bold text-emerald-800">💡 Prueba rápida por defecto:</p>
+                    <p class="text-[11px] text-emerald-700 mt-0.5">Celular: <b>987654321</b> | PIN: <b>123456</b></p>
+                </div>
+            </form>
+        </div>
+
+        <!-- PANEL DE TIENDA REORGANIZADO -->
+        <div id="view-store-panel" class="hidden space-y-6 w-full">
+            
+            <!-- HEADER DE BIENVENIDA Y MÉTRICAS -->
+            <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-5">
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b pb-4">
+                    <div class="flex items-center gap-4">
+                        <div id="storeHeaderLogoBox" class="w-14 h-14 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-center overflow-hidden shadow-sm flex-shrink-0">
+                            <span class="text-2xl">🏪</span>
+                        </div>
+                        <div>
+                            <h2 id="storePanelName" class="text-xl font-black text-gray-800">Comercio</h2>
+                            <p class="text-xs text-gray-500 mt-0.5"><span id="storePanelCategory" class="font-bold text-emerald-700"></span> · 📱 <span id="storePanelPhone"></span> · 📍 <span id="storePanelAddress"></span></p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MINI-DASHBOARD -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div class="bg-emerald-50/70 border border-emerald-200/80 p-4 rounded-2xl flex items-center justify-between">
+                        <div>
+                            <p class="text-[11px] font-bold text-emerald-800 uppercase tracking-wider">Ventas del Día</p>
+                            <p id="dashTotalSales" class="text-xl font-black text-emerald-900 mt-0.5">S/ 0.00</p>
+                        </div>
+                        <div class="w-11 h-11 bg-emerald-600 text-white rounded-2xl flex items-center justify-center shadow-md"><i class="fa-solid fa-wallet"></i></div>
+                    </div>
+                    <div class="bg-amber-50/70 border border-amber-200/80 p-4 rounded-2xl flex items-center justify-between">
+                        <div>
+                            <p class="text-[11px] font-bold text-amber-800 uppercase tracking-wider">Pedidos Registrados</p>
+                            <p id="dashTotalOrders" class="text-xl font-black text-amber-900 mt-0.5">0</p>
+                        </div>
+                        <div class="w-11 h-11 bg-amber-600 text-white rounded-2xl flex items-center justify-center shadow-md"><i class="fa-solid fa-bag-shopping"></i></div>
+                    </div>
+                    <div class="bg-purple-50/70 border border-purple-200/80 p-4 rounded-2xl flex items-center justify-between">
+                        <div>
+                            <p class="text-[11px] font-bold text-purple-800 uppercase tracking-wider">Productos Activos</p>
+                            <p id="dashTotalProducts" class="text-xl font-black text-purple-900 mt-0.5">0</p>
+                        </div>
+                        <div class="w-11 h-11 bg-purple-600 text-white rounded-2xl flex items-center justify-center shadow-md"><i class="fa-solid fa-boxes-stacked"></i></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- NAVEGACIÓN PRINCIPAL (4 MÓDULOS) -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 bg-gray-200/70 p-1.5 rounded-2xl">
+                <button onclick="switchStoreTab('orders')" id="btn-tab-orders" class="py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-emerald-600 text-white transition shadow-sm flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-cart-shopping"></i> <span>Pedidos & Ventas</span>
+                </button>
+                <button onclick="switchStoreTab('products')" id="btn-tab-products" class="py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-transparent text-gray-700 hover:bg-white/60 transition flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-boxes-stacked"></i> <span>Catálogo & Stock</span>
+                </button>
+                <button onclick="switchStoreTab('logistics')" id="btn-tab-logistics" class="py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-transparent text-gray-700 hover:bg-white/60 transition flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-motorcycle"></i> <span>Logística & Mapa</span>
+                </button>
+                <button onclick="switchStoreTab('config')" id="btn-tab-config" class="py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-transparent text-gray-700 hover:bg-white/60 transition flex items-center justify-center gap-2">
+                    <i class="fa-solid fa-store"></i> <span>Mi Negocio</span>
+                </button>
+            </div>
+
+            <!-- MÓDULO 1: PEDIDOS & VENTAS -->
+            <div id="sec-tab-orders" class="space-y-6">
+                <!-- Emitir Pedido Manual Múltiple -->
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-5">
+                    <h3 class="text-base font-bold text-gray-800 border-b pb-3 flex items-center gap-2">
+                        <i class="fa-solid fa-file-pen text-emerald-600"></i> Emitir Pedido Manual Multiproducto & Vuelto
+                    </h3>
+                    <form id="orderForm" onsubmit="handleOrderSubmit(event)" class="space-y-4">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 mb-1">Nombre del Cliente</label>
+                                <input type="text" id="orderClientName" required class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-50" placeholder="Ej. María López">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 mb-1">Celular del Cliente</label>
+                                <input type="tel" id="orderClientPhone" required class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-50" placeholder="999999999">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 mb-1">Asignar Repartidor Inicial</label>
+                                <select id="orderDriverSelect" required class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-50 font-medium">
+                                    <option value="">Selecciona un repartidor...</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- CONSTRUCTOR DE CARRITO DE PRODUCTOS MÚLTIPLES -->
+                        <div class="bg-emerald-50/50 p-4 rounded-2xl border border-emerald-200 space-y-3">
+                            <label class="block text-xs font-bold text-emerald-900 uppercase flex items-center justify-between">
+                                <span>🛒 Agregar Productos al Pedido (Selecciona varios)</span>
+                                <span class="text-[10px] text-emerald-700 font-normal">Soporta más de 100 productos</span>
+                            </label>
+                            
+                            <div class="grid grid-cols-1 md:grid-cols-12 gap-2 relative">
+                                <div class="md:col-span-7 relative">
+                                    <input type="text" id="manualCartSearch" oninput="filterManualCartAutocomplete(this.value)" placeholder="🔍 Buscar plato o producto en el catálogo..." class="w-full rounded-xl border border-gray-300 p-2.5 text-xs bg-white font-medium">
+                                    <div id="manualCartDropdown" class="absolute left-0 right-0 mt-1 bg-white border border-gray-200 rounded-2xl shadow-xl max-h-48 overflow-y-auto hidden z-30 divide-y divide-gray-100"></div>
+                                </div>
+                                <div class="md:col-span-3">
+                                    <input type="number" id="manualCartQty" min="1" value="1" class="w-full rounded-xl border border-gray-300 p-2.5 text-xs bg-white text-center font-bold" placeholder="Cantidad">
+                                </div>
+                                <div class="md:col-span-2">
+                                    <button type="button" onclick="addSelectedItemToManualCart()" class="w-full bg-emerald-600 text-white font-bold py-2.5 px-3 rounded-xl text-xs hover:bg-emerald-700 transition shadow-sm">
+                                        <i class="fa-solid fa-plus"></i> Agregar
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div id="manualCartItemsList" class="space-y-1.5 pt-1">
+                                <p class="text-[11px] text-gray-400 italic">No hay productos agregados a este pedido todavía.</p>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 mb-1">Monto Total Calculado (S/.)</label>
+                                <input type="number" step="0.01" id="orderTotal" readonly required class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-100 font-black text-emerald-800" placeholder="0.00">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 mb-1">Método de Pago</label>
+                                <select id="orderPaymentMethod" class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-50 font-semibold text-emerald-700">
+                                    <option value="Efectivo">💵 Efectivo</option>
+                                    <option value="Yape">🟣 Yape</option>
+                                    <option value="Plin">🔵 Plin</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- DIRECCIÓN DE ENTREGA CON MAPA INTERACTIVO -->
+                        <div class="space-y-2">
+                            <label class="block text-xs font-bold text-gray-700 flex items-center justify-between">
+                                <span>📍 Dirección de Entrega (Haz clic en el mapa para ubicar automáticamente)</span>
+                                <span class="text-[10px] text-emerald-700 font-normal"><i class="fa-solid fa-location-crosshairs"></i> Autocompletado GPS</span>
+                            </label>
+                            <input type="text" id="orderAddress" required class="w-full rounded-xl border border-gray-300 p-3 text-sm bg-gray-50 font-medium" placeholder="Haz clic en el mapa o escribe la dirección...">
+                            <div id="orderDeliveryMap" style="width: 100%; height: 220px;" class="rounded-2xl border border-gray-200 shadow-inner"></div>
+                        </div>
+
+                        <!-- Calculadora de Vuelto -->
+                        <div class="bg-emerald-50/80 p-4 rounded-2xl border border-emerald-200 flex flex-col md:flex-row items-center justify-between gap-3">
+                            <div>
+                                <label class="block text-[11px] font-bold text-emerald-900 uppercase">¿Con cuánto paga el cliente en efectivo?</label>
+                                <input type="number" step="0.01" id="orderCashGiven" oninput="calculateChange()" placeholder="Ej. 50.00" class="w-full md:w-48 mt-1 rounded-xl border border-emerald-300 bg-white p-2.5 text-sm font-bold">
+                            </div>
+                            <div class="text-right">
+                                <p class="text-[11px] font-bold text-emerald-900 uppercase">Vuelto Calculado</p>
+                                <p id="orderChangeDisplay" class="text-xl font-black text-emerald-700 mt-0.5">S/ 0.00</p>
+                            </div>
+                        </div>
+
+                        <button type="submit" class="w-full bg-emerald-600 text-white font-bold py-3.5 px-4 rounded-2xl hover:bg-emerald-700 transition shadow-md text-sm flex items-center justify-center gap-2">
+                            <i class="fa-solid fa-paper-plane"></i> Emitir y Enviar Pedido
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Bandeja de Pedidos con Filtros -->
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-5">
+                    <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b pb-3 gap-3">
+                        <h3 class="text-base font-bold text-gray-800 flex items-center gap-2">
+                            <i class="fa-solid fa-clipboard-list text-emerald-600"></i> Pedidos Recibidos (Con Hora y Ruta)
+                        </h3>
+                        <div class="flex flex-wrap gap-2">
+                            <button type="button" onclick="setOrderFilter('all')" id="filterBtn-all" class="text-xs px-3.5 py-2 rounded-xl font-bold bg-emerald-600 text-white transition shadow-sm">Todos</button>
+                            <button type="button" onclick="setOrderFilter('app')" id="filterBtn-app" class="text-xs px-3.5 py-2 rounded-xl font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition">📱 De la App</button>
+                            <button type="button" onclick="setOrderFilter('manual')" id="filterBtn-manual" class="text-xs px-3.5 py-2 rounded-xl font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition">✍️ Mis Manuales</button>
+                        </div>
+                    </div>
+                    <div id="clientOrdersContainer" class="space-y-3">
+                        <p class="text-xs text-gray-400 text-center py-6">No hay pedidos registrados aún.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- MÓDULO 2: CATÁLOGO & STOCK -->
+            <div id="sec-tab-products" class="hidden space-y-6">
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-6">
+                    <div class="flex flex-col md:flex-row justify-between items-start md:items-center border-b pb-3 gap-3">
+                        <h3 class="text-base font-bold text-gray-800 flex items-center gap-2">
+                            <i class="fa-solid fa-utensils text-emerald-600"></i> Gestión de Productos y Menú
+                        </h3>
+                        <div class="w-full md:w-64">
+                            <input type="text" id="searchProductInput" oninput="renderStoreProducts()" placeholder="🔍 Buscar en mis productos..." class="w-full px-3.5 py-2 text-xs rounded-xl border border-gray-300 bg-gray-50 focus:ring-2 focus:ring-emerald-500">
+                        </div>
+                    </div>
+                    
+                    <form id="productForm" onsubmit="handleProductSubmit(event)" class="space-y-4 bg-gray-50/80 p-5 rounded-2xl border border-gray-200">
+                        <input type="hidden" id="editingProductId">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 uppercase mb-1 flex items-center justify-between">
+                                    <span>Nombre del Plato/Producto</span>
+                                    <span class="text-[10px] text-emerald-700 font-normal"><i class="fa-solid fa-wand-magic-sparkles"></i> IA Vocabulario</span>
+                                </label>
+                                <input type="text" id="prodName" required onblur="checkPeruvianSmartFill()" class="w-full rounded-xl border p-3 text-sm bg-white font-medium" placeholder="Ej. Juane, Suri, Cecina...">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-gray-700 uppercase mb-1">Precio (S/.)</label>
+                                <input type="number" step="0.01" id="prodPrice" required class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="15.00">
+                            </div>
+                            <div class="grid grid-cols-2 gap-2">
+                                <div>
+                                    <label class="block text-xs font-bold text-gray-700 uppercase mb-1">Stock</label>
+                                    <input type="number" id="prodStock" min="0" value="20" required class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="20">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-gray-700 uppercase mb-1">Unidad</label>
+                                    <select id="prodUnit" class="w-full rounded-xl border p-3 text-sm bg-white">
+                                        <option value="plato">plato</option>
+                                        <option value="porción">porción</option>
+                                        <option value="kg">kg</option>
+                                        <option value="unidad">unidad</option>
+                                        <option value="vaso">vaso</option>
+                                        <option value="botella">botella</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-gray-700 uppercase mb-1">Descripción e Ingredientes</label>
+                            <textarea id="prodDesc" rows="2" class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="Detalla los ingredientes..."></textarea>
+                        </div>
+
+                        <!-- Subproductos / Extras -->
+                        <div class="bg-emerald-50/50 p-4 rounded-2xl border border-emerald-200 space-y-3">
+                            <label class="block text-xs font-bold text-gray-700 uppercase flex items-center justify-between">
+                                <span>Subproductos / Extras / Acompañamientos</span>
+                                <span class="text-[10px] text-emerald-700 font-normal">Opcional</span>
+                            </label>
+                            <div class="flex gap-2">
+                                <input type="text" id="subprodName" placeholder="Ej. Porción extra de yuca..." class="w-full rounded-xl border p-2.5 text-xs bg-white">
+                                <input type="number" step="0.01" id="subprodPrice" placeholder="Precio S/." class="w-28 rounded-xl border p-2.5 text-xs bg-white">
+                                <button type="button" onclick="addSubproductToList()" class="bg-emerald-600 text-white font-bold px-4 py-2.5 rounded-xl text-xs hover:bg-emerald-700 transition shadow-sm">
+                                    <i class="fa-solid fa-plus"></i> Agregar
+                                </button>
+                            </div>
+                            <div id="subproductsListContainer" class="space-y-1.5 pt-1">
+                                <p class="text-[11px] text-gray-400 italic">No hay subproductos agregados.</p>
+                            </div>
+                        </div>
+
+                        <!-- Fotos con Opciones -->
+                        <div>
+                            <label class="block text-xs font-bold text-gray-700 uppercase mb-1">Foto del Producto (Diccionario, IA y Estudio Pro)</label>
+                            <div class="grid grid-cols-4 gap-1.5 mb-3">
+                                <button type="button" onclick="switchImageSource('file')" id="tabImgFile" class="py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-emerald-600 text-white transition shadow-sm">📁 Archivo</button>
+                                <button type="button" onclick="switchImageSource('web')" id="tabImgWeb" class="py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition">🌐 Buscador</button>
+                                <button type="button" onclick="switchImageSource('ai')" id="tabImgAI" class="py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition">✨ IA</button>
+                                <button type="button" onclick="switchImageSource('studio')" id="tabImgStudio" class="py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition">🎨 Estudio Pro</button>
+                            </div>
+
+                            <div id="imgSourceFileContainer">
+                                <input type="file" id="prodImageFile" accept="image/*" onchange="handleFilePreview(event)" class="w-full text-xs text-gray-500 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100 cursor-pointer border rounded-xl bg-white p-2">
+                            </div>
+
+                            <div id="imgSourceWebContainer" class="hidden space-y-2.5">
+                                <div class="flex gap-2">
+                                    <input type="text" id="webImageQuery" placeholder="Ej. Juane, Suri..." class="w-full rounded-xl border p-2.5 text-xs bg-white">
+                                    <button type="button" onclick="searchWebImages()" class="bg-blue-600 text-white font-bold px-4 py-2.5 rounded-xl text-xs hover:bg-blue-700 transition">Buscar</button>
+                                </div>
+                                <div id="webImagesResults" class="grid grid-cols-3 gap-2 pt-1">
+                                    <p class="text-[11px] text-gray-400 col-span-3 text-center py-2">Escribe un plato regional y pulsa Buscar.</p>
+                                </div>
+                            </div>
+
+                            <div id="imgSourceAIContainer" class="hidden space-y-2.5">
+                                <div class="flex gap-2">
+                                    <input type="text" id="aiImagePrompt" placeholder="Ej. plato típico de juane de gallina" class="w-full rounded-xl border p-2.5 text-xs bg-white">
+                                    <button type="button" onclick="generateAIProductImage()" class="bg-purple-600 text-white font-bold px-4 py-2.5 rounded-xl text-xs hover:bg-purple-700 transition">Generar</button>
+                                </div>
+                            </div>
+
+                            <div id="imgSourceStudioContainer" class="hidden space-y-3 bg-white p-4 rounded-2xl border border-gray-200 shadow-sm">
+                                <div class="flex items-center justify-between border-b pb-2">
+                                    <h4 class="text-xs font-bold text-gray-800 uppercase">Editor Fotográfico Pro</h4>
+                                    <button type="button" onclick="resetStudioFilters()" class="text-[10px] text-red-600 font-bold">Restaurar</button>
+                                </div>
+                                <div class="grid grid-cols-2 gap-3">
+                                    <div><label class="text-[10px] font-bold text-gray-600 block mb-1">Brillo</label><input type="range" id="studioBrightness" min="70" max="150" value="100" oninput="applyStudioFilters()" class="w-full accent-emerald-600"></div>
+                                    <div><label class="text-[10px] font-bold text-gray-600 block mb-1">Contraste</label><input type="range" id="studioContrast" min="70" max="150" value="100" oninput="applyStudioFilters()" class="w-full accent-emerald-600"></div>
+                                </div>
+                            </div>
+
+                            <div id="productPreviewWrapper" class="hidden mt-3 p-3 bg-white rounded-2xl border flex items-center justify-between shadow-sm">
+                                <div class="flex items-center gap-3">
+                                    <img id="productPreviewImg" src="" class="w-14 h-14 object-cover rounded-xl border cursor-pointer" onclick="openImageModal(currentSelectedImageUrl)">
+                                    <p class="text-xs font-bold text-gray-800">Imagen lista para guardar</p>
+                                </div>
+                                <button type="button" onclick="clearProductImage()" class="bg-red-50 text-red-600 px-3 py-1.5 rounded-xl text-xs font-bold">Quitar</button>
+                            </div>
+                            <input type="hidden" id="finalProductImageUrl" value="">
+                        </div>
+
+                        <div class="flex gap-2">
+                            <button type="submit" id="productSubmitBtn" class="flex-1 bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 transition text-sm shadow-md">Guardar Producto</button>
+                            <button type="button" onclick="resetProductForm()" id="productCancelBtn" class="hidden bg-gray-200 text-gray-700 font-bold px-4 py-3 rounded-xl text-sm">Cancelar</button>
+                        </div>
+                    </form>
+
+                    <div id="storeProductsTableBody" class="space-y-3 pt-2"></div>
+                </div>
+            </div>
+
+            <!-- MÓDULO 3: LOGÍSTICA & MAPA -->
+            <div id="sec-tab-logistics" class="hidden space-y-6">
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-5">
+                    <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 border-b pb-3">
+                        <h3 class="text-base font-bold text-gray-800 flex items-center gap-2">
+                            <i class="fa-solid fa-motorcycle text-emerald-600"></i> Repartidores del Comercio
+                        </h3>
+                        <button type="button" onclick="openDriverForm()" class="bg-emerald-600 text-white px-4 py-2.5 rounded-xl text-xs font-bold hover:bg-emerald-700 transition shadow-sm">
+                            <i class="fa-solid fa-plus"></i> Registrar Repartidor
+                        </button>
+                    </div>
+
+                    <form id="driverForm" onsubmit="saveStoreDriver(event)" class="hidden bg-gray-50 p-5 rounded-2xl border border-gray-200 space-y-4">
+                        <input type="hidden" id="editingDriverId">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">Nombre completo</label><input id="driverName" required class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="Ej. Carlos Pérez"></div>
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">Celular</label><input id="driverPhone" required pattern="[0-9]{9}" maxlength="9" class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="999999999"></div>
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">DNI</label><input id="driverDni" required pattern="[0-9]{8}" maxlength="8" class="w-full rounded-xl border p-3 text-sm bg-white" placeholder="12345678"></div>
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">PIN de acceso</label><input id="driverPin" required pattern="[0-9]{6}" maxlength="6" inputmode="numeric" class="w-full rounded-xl border p-3 text-sm bg-white font-mono tracking-widest" placeholder="6 dígitos"></div>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">Vehículo</label><select id="driverVehicle" class="w-full rounded-xl border p-3 text-sm bg-white"><option value="Moto">🏍️ Moto</option><option value="Mototaxi">🛺 Mototaxi</option><option value="Bicicleta">🚲 Bicicleta</option><option value="Auto">🚗 Auto</option></select></div>
+                            <div><label class="block text-xs font-bold text-gray-700 mb-1">Estado</label><select id="driverStatus" class="w-full rounded-xl border p-3 text-sm bg-white"><option value="Activo">Activo</option><option value="Inactivo">Inactivo</option></select></div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button type="submit" class="flex-1 bg-emerald-600 text-white font-bold py-3 rounded-xl">Guardar Repartidor</button>
+                            <button type="button" onclick="closeDriverForm()" class="bg-gray-200 text-gray-700 font-bold px-5 py-3 rounded-xl">Cancelar</button>
+                        </div>
+                    </form>
+
+                    <div id="storeDriversTableBody" class="space-y-3"></div>
+                </div>
+
+                <!-- Mapa en vivo y rutas -->
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-4">
+                    <div class="flex flex-col md:flex-row justify-between md:items-center gap-3 border-b pb-3">
+                        <h3 class="text-base font-bold text-gray-800 flex items-center gap-2">
+                            <i class="fa-solid fa-map-location-dot text-emerald-600"></i> Mapa de Ubicación y Rutas en Tiempo Real
+                        </h3>
+                        <div class="flex items-center gap-2">
+                            <span class="inline-flex items-center gap-2 text-xs font-bold bg-emerald-50 text-emerald-700 px-3 py-2 rounded-xl border border-emerald-200"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span id="mapLiveStatus">GPS de repartidores</span></span>
+                            <button type="button" onclick="refreshStoreDriverMap()" class="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-xl text-xs font-bold"><i class="fa-solid fa-rotate"></i> Actualizar</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <div class="bg-emerald-50 border border-emerald-200 rounded-xl p-3"><p class="text-[10px] font-bold uppercase text-emerald-700">En línea</p><p id="mapOnlineCount" class="text-xl font-black text-emerald-900">0</p></div>
+                        <div class="bg-blue-50 border border-blue-200 rounded-xl p-3"><p class="text-[10px] font-bold uppercase text-blue-700">Con GPS</p><p id="mapGpsCount" class="text-xl font-black text-blue-900">0</p></div>
+                        <div class="bg-amber-50 border border-amber-200 rounded-xl p-3"><p class="text-[10px] font-bold uppercase text-amber-700">Sin señal</p><p id="mapOfflineCount" class="text-xl font-black text-amber-900">0</p></div>
+                        <div class="bg-gray-50 border border-gray-200 rounded-xl p-3"><p class="text-[10px] font-bold uppercase text-gray-600">Total</p><p id="mapTotalCount" class="text-xl font-black text-gray-900">0</p></div>
+                    </div>
+                    <div id="storeDriverMap" style="width: 100%; height: 400px;" class="rounded-2xl overflow-hidden border border-gray-200 shadow-inner"></div>
+                </div>
+            </div>
+
+            <!-- MÓDULO 4: MI NEGOCIO -->
+            <div id="sec-tab-config" class="hidden space-y-6">
+                <div id="proAccessCard" class="hidden bg-gradient-to-r from-amber-50 via-white to-emerald-50 p-5 rounded-3xl border border-amber-200 shadow-sm">
+                    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <span class="w-10 h-10 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center text-lg shadow-sm">⭐</span>
+                                <div>
+                                    <h3 class="text-base font-black text-gray-800">PRO</h3>
+                                    <p class="text-xs text-gray-500">Funciones y paneles especializados habilitados para tu negocio.</p>
+                                </div>
+                            </div>
+                            <p id="proAccessSummary" class="text-xs font-semibold text-emerald-700 mt-3">Tienes funciones PRO disponibles.</p>
+                            <div id="proModulesGrid" class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4"></div>
+                        </div>
+                        <button type="button" onclick="openProModule()" class="w-full md:w-auto bg-amber-500 hover:bg-amber-600 text-white px-5 py-3 rounded-xl text-xs font-black shadow-md transition flex items-center justify-center gap-2">
+                            <i class="fa-solid fa-star"></i> Ver PRO
+                        </button>
+                    </div>
+                </div>
+
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 space-y-5">
+                    <h3 class="text-base font-bold text-gray-800 border-b pb-3 flex items-center gap-2">
+                        <i class="fa-solid fa-store text-emerald-600"></i> Identidad e Imagen del Comercio
+                    </h3>
+                    <div class="flex flex-col md:flex-row items-center gap-6 bg-gray-50 p-5 rounded-2xl border border-gray-200">
+                        <div class="w-32 h-32 rounded-2xl bg-white border-2 border-dashed border-gray-300 flex items-center justify-center overflow-hidden shadow-sm">
+                            <span id="storeLogoPlaceholder" class="text-4xl">🏪</span>
+                            <img id="storeLogoPreview" src="" alt="Logo del negocio" class="hidden w-full h-full object-contain p-2">
+                        </div>
+                        <div class="flex-1 w-full">
+                            <p class="font-bold text-gray-800 text-sm">Logo oficial del establecimiento</p>
+                            <p class="text-xs text-gray-500 mt-1 mb-4">PNG, JPG o SVG. Máximo 2 MB.</p>
+                            <div class="flex flex-wrap gap-2">
+                                <label class="cursor-pointer bg-emerald-600 text-white px-4 py-2.5 rounded-xl text-xs font-bold hover:bg-emerald-700 transition inline-flex items-center gap-2 shadow-sm">
+                                    <i class="fa-solid fa-upload"></i> Subir logo
+                                    <input id="storeLogoInput" type="file" accept="image/png,image/jpeg,image/svg+xml" class="hidden" onchange="handleStoreLogoUpload(event)">
+                                </label>
+                                <button type="button" onclick="removeStoreLogo()" class="bg-red-50 text-red-600 px-4 py-2.5 rounded-xl text-xs font-bold border border-red-200 hover:bg-red-100 transition">Eliminar logo</button>
+                            </div>
+                            <p id="storeLogoMessage" class="text-xs mt-3 font-semibold text-gray-500"></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </main>
+
+    <!-- Modales -->
+    <div id="customModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center hidden z-50 p-4">
+        <div class="bg-white rounded-3xl p-6 md:p-8 max-w-sm w-full text-center shadow-2xl border border-gray-100">
+            <div id="modalIcon" class="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold">✓</div>
+            <h3 id="modalTitle" class="text-lg font-bold text-gray-800 mb-2">¡Aviso!</h3>
+            <p id="modalMessage" class="text-sm text-gray-600 mb-6 leading-relaxed">Mensaje.</p>
+            <button onclick="closeModal()" class="w-full bg-emerald-600 text-white font-bold py-3 px-4 rounded-xl hover:bg-emerald-700 transition text-sm shadow-md">Aceptar</button>
+        </div>
+    </div>
+
+    <div id="imageModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4" onclick="closeImageModal()">
+        <div class="relative max-w-lg w-full bg-white rounded-3xl overflow-hidden shadow-2xl p-4 flex flex-col items-center" onclick="event.stopPropagation()">
+            <button onclick="closeImageModal()" class="absolute top-4 right-4 bg-gray-900 text-white w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold">✕</button>
+            <h3 class="text-xs font-bold text-gray-700 mb-3 uppercase tracking-wider">Vista Previa Ampliada</h3>
+            <img id="modalImageFull" src="" class="w-full max-h-[70vh] object-contain rounded-2xl border bg-gray-50">
+        </div>
+    </div>
+
+    <footer class="text-center py-4 text-xs text-gray-400">
+        ASTOREECO Pucallpa &copy; 2026
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        window.addEventListener('resize', () => {
+            if (window.storeDriverMap) window.storeDriverMap.invalidateSize();
+            if (window.orderDeliveryMap) window.orderDeliveryMap.invalidateSize();
+        });
+
+        let storesData = JSON.parse(localStorage.getItem('astoreeco_stores')) || [];
+        if (!storesData.length) {
+            storesData = [{
+                ruc: "20123456789", phone: "987654321", celular: "987654321", pin: "123456",
+                name: "Comercio Ejemplo Pucallpa", category: "Comida Típica", address: "Jr. Yarinacocha 123"
+            }];
+            localStorage.setItem('astoreeco_stores', JSON.stringify(storesData));
+        }
+
+        let driversData = JSON.parse(localStorage.getItem('astoreeco_drivers')) || [];
+        
+        let productsData = JSON.parse(localStorage.getItem('astoreeco_products')) || [];
+        if (!productsData.length) {
+            productsData = [
+                { id: 101, storePhone: "987654321", name: "Juane de Gallina", price: 15.00, stock: 25, unit: "unidad", desc: "Tradicional juane de arroz con gallina de chacra y hoja de bijao.", image: "https://images.unsplash.com/photo-1540420773420-3366772f4999?w=400&q=80", subproducts: [] },
+                { id: 102, storePhone: "987654321", name: "Tacacho con Cecina", price: 22.00, stock: 15, unit: "plato", desc: "Majado de plátano verde con cecina regional ahumada.", image: "https://images.unsplash.com/photo-1626353675865-1f9e2b1686c1?w=400&q=80", subproducts: [] },
+                { id: 103, storePhone: "987654321", name: "Refresco de Cocona", price: 5.00, stock: 40, unit: "vaso", desc: "Bebida amazónica fresca y ácida.", image: "https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd?w=400&q=80", subproducts: [] }
+            ];
+            localStorage.setItem('astoreeco_products', JSON.stringify(productsData));
+        }
+
+        let ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+
+        let currentLoggedStorePhone = localStorage.getItem('astoreeco_current_store') || null;
+        let currentSelectedImageUrl = '';
+        let isSolarModeActive = false;
+        let currentSubproductsList = []; 
+        window.currentOrderFilter = 'all';
+
+        let currentManualOrderItems = [];
+        let selectedProductForManualCart = null;
+
+        let orderDeliveryMap = null;
+        let orderDeliveryMarker = null;
+
+        function initOrderDeliveryMap() {
+            const el = document.getElementById('orderDeliveryMap');
+            if (!el || typeof L === 'undefined') return;
+            if (!orderDeliveryMap) {
+                orderDeliveryMap = L.map(el, { zoomControl: true }).setView([-8.3791, -74.5539], 14);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(orderDeliveryMap);
+
+                orderDeliveryMap.on('click', async function(e) {
+                    const lat = e.latlng.lat;
+                    const lng = e.latlng.lng;
+
+                    if (orderDeliveryMarker) {
+                        orderDeliveryMarker.setLatLng([lat, lng]);
+                    } else {
+                        orderDeliveryMarker = L.marker([lat, lng]).addTo(orderDeliveryMap);
+                    }
+
+                    const addressInput = document.getElementById('orderAddress');
+                    addressInput.value = `Cargando dirección... (Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)})`;
+
+                    try {
+                        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`);
+                        const data = await response.json();
+                        if (data && data.display_name) {
+                            addressInput.value = data.display_name;
+                        } else {
+                            addressInput.value = `Ubicación: Lat ${lat.toFixed(5)}, Lng ${lng.toFixed(5)}`;
+                        }
+                    } catch (err) {
+                        addressInput.value = `Ubicación: Lat ${lat.toFixed(5)}, Lng ${lng.toFixed(5)}`;
+                    }
+                });
+            }
+            setTimeout(() => { if (orderDeliveryMap) orderDeliveryMap.invalidateSize(); }, 150);
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            if (currentLoggedStorePhone) {
+                storesData = JSON.parse(localStorage.getItem('astoreeco_stores')) || [];
+                const foundStore = storesData.find(s => String(s.phone || s.celular) === String(currentLoggedStorePhone));
+                if (foundStore) showStoreView(foundStore);
+                else logout();
+            }
+        });
+
+        function addSubproductToList() {
+            const nameInput = document.getElementById('subprodName');
+            const priceInput = document.getElementById('subprodPrice');
+            const name = nameInput.value.trim();
+            const price = parseFloat(priceInput.value);
+            if (!name || isNaN(price) || price < 0) { showModal("Atención", "Ingresa nombre y precio válido.", true); return; }
+            currentSubproductsList.push({ id: Date.now() + Math.random(), name, price });
+            nameInput.value = ''; priceInput.value = ''; renderFormSubproducts();
+        }
+
+        function removeSubproductFromList(id) {
+            currentSubproductsList = currentSubproductsList.filter(sp => sp.id !== id);
+            renderFormSubproducts();
+        }
+
+        function renderFormSubproducts() {
+            const container = document.getElementById('subproductsListContainer');
+            if (currentSubproductsList.length === 0) { container.innerHTML = '<p class="text-[11px] text-gray-400 italic">No hay subproductos agregados.</p>'; return; }
+            container.innerHTML = currentSubproductsList.map(sp => `
+                <div class="flex items-center justify-between bg-white px-3 py-2 rounded-xl border border-emerald-100 shadow-sm text-xs">
+                    <span class="font-medium text-gray-800">${sp.name} — <strong class="text-emerald-700">S/ ${sp.price.toFixed(2)}</strong></span>
+                    <button type="button" onclick="removeSubproductFromList(${sp.id})" class="text-red-600 font-bold px-2">✕</button>
+                </div>
+            `).join('');
+        }
+
+        function toggleSolarMode() {
+            isSolarModeActive = !isSolarModeActive;
+            const body = document.getElementById('mainBody');
+            const btnText = document.getElementById('solarModeText');
+            const btn = document.getElementById('solarModeBtn');
+            if (isSolarModeActive) {
+                body.className = "bg-yellow-50 font-sans min-h-screen flex flex-col justify-between transition-colors duration-300";
+                btn.className = "text-xs bg-yellow-900 text-yellow-100 px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 shadow-md border border-yellow-400";
+                btnText.innerText = "Modo Normal";
+            } else {
+                body.className = "bg-gray-50 font-sans min-h-screen flex flex-col justify-between transition-colors duration-300";
+                btn.className = "text-xs bg-emerald-800 hover:bg-emerald-900 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5 shadow-sm";
+                btnText.innerText = "Modo Sol";
+            }
+        }
+
+        function calculateChange() {
+            const total = parseFloat(document.getElementById('orderTotal').value) || 0;
+            const given = parseFloat(document.getElementById('orderCashGiven').value) || 0;
+            const changeDisplay = document.getElementById('orderChangeDisplay');
+            if (given >= total) {
+                changeDisplay.innerText = `S/ ${(given - total).toFixed(2)}`;
+                changeDisplay.className = "text-xl font-black text-emerald-700 mt-0.5";
+            } else {
+                changeDisplay.innerText = "Monto menor al total";
+                changeDisplay.className = "text-xs font-bold text-red-600 mt-1";
+            }
+        }
+
+        function showModal(title, message, isError = false) {
+            document.getElementById('modalTitle').innerText = title;
+            document.getElementById('modalMessage').innerText = message;
+            const icon = document.getElementById('modalIcon');
+            icon.className = isError ? "w-16 h-16 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold" : "w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold";
+            icon.innerText = isError ? "✕" : "✓";
+            document.getElementById('customModal').classList.remove('hidden');
+        }
+        function closeModal() { document.getElementById('customModal').classList.add('hidden'); }
+        function openImageModal(url) { if(!url)return; document.getElementById('modalImageFull').src = url; document.getElementById('imageModal').classList.remove('hidden'); }
+        function closeImageModal() { document.getElementById('imageModal').classList.add('hidden'); }
+
+        function switchImageSource(type) {
+            ['file', 'web', 'ai', 'studio'].forEach(t => {
+                document.getElementById(`tabImg${t.charAt(0).toUpperCase() + t.slice(1)}`).className = "py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-gray-100 text-gray-700 hover:bg-gray-200 transition";
+                document.getElementById(`imgSource${t.charAt(0).toUpperCase() + t.slice(1)}Container`).classList.add('hidden');
+            });
+            document.getElementById(`tabImg${type.charAt(0).toUpperCase() + type.slice(1)}`).className = "py-2 px-1 text-[10px] md:text-[11px] font-bold rounded-xl bg-emerald-600 text-white transition shadow-sm";
+            document.getElementById(`imgSource${type.charAt(0).toUpperCase() + type.slice(1)}Container`).classList.remove('hidden');
+        }
+
+        function applyStudioFilters() {
+            const b = document.getElementById('studioBrightness').value;
+            const c = document.getElementById('studioContrast').value;
+            document.getElementById('productPreviewImg').style.filter = `brightness(${b}%) contrast(${c}%)`;
+        }
+        function resetStudioFilters() { document.getElementById('studioBrightness').value=100; document.getElementById('studioContrast').value=100; applyStudioFilters(); }
+
+        function handleFilePreview(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    currentSelectedImageUrl = e.target.result;
+                    const img = document.getElementById('productPreviewImg');
+                    img.src = currentSelectedImageUrl; img.style.filter = 'none';
+                    document.getElementById('productPreviewWrapper').classList.remove('hidden');
+                    document.getElementById('finalProductImageUrl').value = currentSelectedImageUrl;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        function handleUnifiedLogin(e) {
+            e.preventDefault();
+            const identifier = document.getElementById('loginIdentifier').value.trim();
+            const pin = document.getElementById('loginPin').value.trim();
+            storesData = JSON.parse(localStorage.getItem('astoreeco_stores')) || [];
+            const foundStore = storesData.find(s => (String(s.ruc) === identifier || String(s.phone || s.celular) === identifier) && String(s.pin) === pin);
+            if (foundStore) {
+                currentLoggedStorePhone = String(foundStore.phone || foundStore.celular);
+                localStorage.setItem('astoreeco_current_store', currentLoggedStorePhone);
+                showStoreView(foundStore);
+                return;
+            }
+            showModal("Acceso Denegado", "Credenciales incorrectas. (Prueba 987654321 / 123456)", true);
+        }
+
+        function getCurrentStoreRecord() {
+            storesData = JSON.parse(localStorage.getItem('astoreeco_stores') || '[]');
+            return storesData.find(s => String(s.phone || s.celular) === String(currentLoggedStorePhone)) || null;
+        }
+
+        function renderStoreLogo() {
+            const store = getCurrentStoreRecord(), logo = store && store.logo ? store.logo : '';
+            const p = document.getElementById('storeLogoPreview'), ph = document.getElementById('storeLogoPlaceholder'), hb = document.getElementById('storeHeaderLogoBox'), st = document.getElementById('storeLogoMessage');
+            if(p){ p.src = logo; p.classList.toggle('hidden', !logo); }
+            if(ph) ph.classList.toggle('hidden', !!logo);
+            if(hb) hb.innerHTML = logo ? `<img src="${logo}" class="w-full h-full object-contain p-1">` : '<span class="text-2xl">🏪</span>';
+            if(st) st.textContent = logo ? 'Logo activo en el sistema.' : '';
+        }
+
+        function handleStoreLogoUpload(event) {
+            const file = event.target.files[0];
+            if(!file) return;
+            const reader = new FileReader();
+            reader.onload = e => {
+                storesData = JSON.parse(localStorage.getItem('astoreeco_stores') || '[]');
+                const i = storesData.findIndex(x => String(x.phone || x.celular) === String(currentLoggedStorePhone));
+                if(i < 0) return;
+                storesData[i].logo = e.target.result;
+                localStorage.setItem('astoreeco_stores', JSON.stringify(storesData));
+                renderStoreLogo();
+                showModal('Logo guardado', 'Se actualizó la identidad del negocio.');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function removeStoreLogo() {
+            storesData = JSON.parse(localStorage.getItem('astoreeco_stores') || '[]');
+            const i = storesData.findIndex(x => String(x.phone || x.celular) === String(currentLoggedStorePhone));
+            if(i < 0) return;
+            storesData[i].logo = '';
+            localStorage.setItem('astoreeco_stores', JSON.stringify(storesData));
+            renderStoreLogo();
+            showModal('Logo eliminado', 'Se quitó el logo del comercio.');
+        }
+
+        function showStoreView(store) {
+            document.getElementById('view-login').classList.add('hidden');
+            document.getElementById('view-store-panel').classList.remove('hidden');
+            document.getElementById('headerUserBox').classList.remove('hidden');
+            document.getElementById('headerUserBox').classList.add('flex');
+            document.getElementById('storePanelName').innerText = store.name;
+            document.getElementById('storePanelCategory').innerText = store.category;
+            document.getElementById('storePanelPhone').innerText = store.phone || store.celular;
+            document.getElementById('storePanelAddress').innerText = store.address;
+            renderStoreLogo();
+            refreshStoreFeatureAccess();
+            switchStoreTab('orders');
+            renderStoreProducts();
+            updateDashboardMetrics();
+        }
+
+        function logout() {
+            currentLoggedStorePhone = null;
+            localStorage.removeItem('astoreeco_current_store');
+            document.getElementById('headerUserBox').classList.add('hidden');
+            document.getElementById('view-store-panel').classList.add('hidden');
+            document.getElementById('view-login').classList.remove('hidden');
+        }
+
+        // ===== CONTROL DE ACCESO PRO =====
+        const STORE_FEATURES_KEY = 'astoreeco_store_features';
+        function getStoreFeatureState(){
+            const phone=String(currentLoggedStorePhone||'').trim();
+            try{
+                const db=JSON.parse(localStorage.getItem(STORE_FEATURES_KEY)||'{}')||{};
+                const f=db[phone]||{}; const pro=f.pro||{}; const modules=f.proModules||{};
+                const proActive=pro.enabled===true&&pro.paid===true;
+                return {proEnabled:proActive, restaurantsEnabled:proActive&&modules.restaurants===true, hardwareEnabled:proActive&&modules.hardware===true, groceryEnabled:proActive&&modules.grocery===true, fashionEnabled:proActive&&modules.fashion===true, pharmacyEnabled:proActive&&modules.pharmacy===true, technologyEnabled:proActive&&modules.technology===true};
+            }catch(e){return {proEnabled:false};}
+        }
+        function refreshStoreFeatureAccess(){
+            const card=document.getElementById('proAccessCard');
+            if(!card)return;
+            const state=getStoreFeatureState();
+            card.classList.toggle('hidden',!state.proEnabled);
+            const summary=document.getElementById('proAccessSummary');
+            if(summary && state.proEnabled){
+                const modules=[];
+                if(state.restaurantsEnabled) modules.push('🍽️ Restaurantes');
+                if(state.hardwareEnabled) modules.push('🔧 Ferretería');
+                if(state.groceryEnabled) modules.push('🏪 Bodega');
+                if(state.fashionEnabled) modules.push('👕 Ropa');
+                if(state.pharmacyEnabled) modules.push('💊 Farmacia');
+                if(state.technologyEnabled) modules.push('📱 Tecnología');
+                summary.textContent=modules.length ? `Módulos habilitados: ${modules.join(' · ')}` : 'PRO está activo. Aún no tienes un módulo especializado asignado.';
+                const grid=document.getElementById('proModulesGrid');
+                if(grid){
+                    const cards=[];
+                    const defs=[
+                        ['restaurants','🍽️','Restaurantes','ASTORE_ECO_RESTAURANTES_PRO_QR_TIENDA.html'],
+                        ['hardware','🔧','Ferretería',''],
+                        ['grocery','🏪','Bodega',''],
+                        ['fashion','👕','Ropa',''],
+                        ['pharmacy','💊','Farmacia',''],
+                        ['technology','📱','Tecnología','']
+                    ];
+                    defs.forEach(([key,icon,name,file])=>{
+                        if(!state[key+'Enabled']) return;
+                        cards.push(`<button type="button" onclick="openProCardModule('${key}')" class="text-left bg-white border border-emerald-100 hover:border-emerald-300 hover:shadow-md rounded-2xl p-4 transition"><div class="flex items-center gap-3"><span class="w-11 h-11 rounded-xl bg-emerald-50 flex items-center justify-center text-2xl">${icon}</span><span><span class="block text-sm font-black text-gray-900">${name}</span><span class="block text-[10px] text-emerald-700 font-bold mt-1">${file?'ENTRAR AL PANEL':'PRÓXIMAMENTE'}</span></span></div></button>`);
+                    });
+                    grid.innerHTML=cards.length?cards.join(''):'<div class="sm:col-span-2 bg-gray-50 border border-dashed border-gray-300 rounded-2xl p-4 text-center text-xs text-gray-500">PRO está activo, pero el administrador todavía no habilitó ningún módulo.</div>';
+                }
+            }
+        }
+        function openProCardModule(key){
+            const files={restaurants:'ASTORE_ECO_RESTAURANTES_PRO_QR_TIENDA.html'};
+            // Abrir el panel en una ruta relativa segura, conservando la tienda activa.
+            // Si el navegador no resuelve el nombre por la ruta actual, usar la misma carpeta explícitamente.
+            if(key==='restaurants'){
+                const target = new URL('ASTORE_ECO_RESTAURANTES_PRO_QR_TIENDA.html', window.location.href).href;
+                window.location.assign(target);
+                return;
+            }
+            const names={restaurants:'Restaurantes',hardware:'Ferretería',grocery:'Bodega',fashion:'Ropa',pharmacy:'Farmacia',technology:'Tecnología'};
+            if(files[key]){ window.location.href=files[key]; return; }
+            showModal('Módulo PRO', `${names[key]||'Este módulo'} todavía está en desarrollo.`, false);
+        }
+        function openProModule(){
+            const state=getStoreFeatureState();
+            if(!state.proEnabled){showModal('PRO no disponible','Tu acceso PRO requiere pago confirmado y habilitación por el administrador.',true);refreshStoreFeatureAccess();return;}
+            const modules=[];
+            if(state.restaurantsEnabled) modules.push({name:'🍽️ Restaurantes',file:'ASTORE_ECO_RESTAURANTES_PRO_QR_TIENDA.html'});
+            if(state.hardwareEnabled) modules.push({name:'🔧 Ferretería',file:''});
+            if(state.groceryEnabled) modules.push({name:'🏪 Bodega',file:''});
+            if(state.fashionEnabled) modules.push({name:'👕 Ropa',file:''});
+            if(state.pharmacyEnabled) modules.push({name:'💊 Farmacia',file:''});
+            if(state.technologyEnabled) modules.push({name:'📱 Tecnología',file:''});
+            if(!modules.length){showModal('PRO activo','Tu cuenta tiene PRO habilitado, pero todavía no tiene un módulo especializado asignado.',false);return;}
+            if(modules.length===1 && modules[0].file){window.location.assign(new URL(modules[0].file, window.location.href).href);return;}
+            const html='<div class="space-y-2">'+modules.map((m,i)=>`<button onclick="openProSelectedModule(${i})" class="w-full text-left px-4 py-3 rounded-xl border bg-white hover:bg-emerald-50 font-bold">${m.name}</button>`).join('')+'</div>';
+            window.__astoreProModules=modules;
+            showModal('⭐ Módulos PRO','Selecciona el módulo que deseas abrir:'+html,false);
+        }
+        function openProSelectedModule(index){
+            const m=(window.__astoreProModules||[])[index];
+            if(m&&m.file) window.location.assign(new URL(m.file, window.location.href).href);
+            else showModal('Módulo en preparación','Este módulo PRO todavía está en desarrollo.',false);
+        }
+
+        function switchStoreTab(tab) {
+            ['orders', 'products', 'logistics', 'config'].forEach(t => {
+                const sec = document.getElementById(`sec-tab-${t}`);
+                const btn = document.getElementById(`btn-tab-${t}`);
+                if(sec) sec.classList.add('hidden');
+                if(btn) {
+                    btn.className = "py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-transparent text-gray-700 hover:bg-white/60 transition flex items-center justify-center gap-2";
+                }
+            });
+
+            const activeSec = document.getElementById(`sec-tab-${tab}`);
+            const activeBtn = document.getElementById(`btn-tab-${tab}`);
+            if(activeSec) activeSec.classList.remove('hidden');
+            if(activeBtn) {
+                activeBtn.className = "py-3 px-4 font-bold rounded-xl text-xs md:text-sm bg-emerald-600 text-white transition shadow-sm flex items-center justify-center gap-2";
+            }
+
+            if(tab === 'orders') { 
+                loadOrderDrivers(); 
+                if(typeof window.renderClientOrders === 'function') window.renderClientOrders();
+                setTimeout(() => initOrderDeliveryMap(), 200);
+            }
+            if(tab === 'logistics') { 
+                renderStoreDrivers(); 
+                initStoreDriverMap(); 
+                refreshStoreDriverMap();
+                setTimeout(() => { if (window.storeDriverMap) window.storeDriverMap.invalidateSize(); }, 250);
+                setTimeout(() => { if (window.storeDriverMap) window.storeDriverMap.invalidateSize(); }, 600);
+            }
+            if(tab === 'config') { renderStoreLogo(); }
+            updateDashboardMetrics();
+        }
+
+        // AUTOCOMPLETE Y CARRITO MÚLTIPLE DE PEDIDO MANUAL
+        function filterManualCartAutocomplete(query) {
+            const dropdown = document.getElementById('manualCartDropdown');
+            if (!dropdown) return;
+            const q = query.trim().toLowerCase();
+            if (!q) {
+                dropdown.classList.add('hidden');
+                dropdown.innerHTML = '';
+                return;
+            }
+
+            const myProds = (JSON.parse(localStorage.getItem('astoreeco_products')) || []).filter(p => String(p.storePhone) === String(currentLoggedStorePhone));
+            const filtered = myProds.filter(p => p.name.toLowerCase().includes(q) || (p.desc && p.desc.toLowerCase().includes(q)));
+
+            if (!filtered.length) {
+                dropdown.innerHTML = `<div class="p-3 text-xs text-gray-400 text-center">No se encontraron productos</div>`;
+                dropdown.classList.remove('hidden');
+                return;
+            }
+
+            dropdown.innerHTML = filtered.map(p => `
+                <div onclick="selectManualCartProduct(${p.id}, '${p.name.replace(/'/g, "\\'")}', ${p.price})" class="p-2.5 hover:bg-emerald-50 cursor-pointer flex items-center justify-between transition text-xs">
+                    <div class="flex items-center gap-2">
+                        <img src="${p.image || 'https://images.unsplash.com/photo-1540420773420-3366772f4999?w=400&q=80'}" class="w-8 h-8 object-cover rounded-lg border">
+                        <div>
+                            <p class="font-bold text-gray-800">${p.name}</p>
+                            <p class="text-[10px] text-gray-500">Stock: ${p.stock} ${p.unit}</p>
+                        </div>
+                    </div>
+                    <span class="font-black text-emerald-700">S/ ${p.price.toFixed(2)}</span>
+                </div>
+            `).join('');
+            dropdown.classList.remove('hidden');
+        }
+
+        function selectManualCartProduct(id, name, price) {
+            selectedProductForManualCart = { id, name, price };
+            document.getElementById('manualCartSearch').value = name;
+            document.getElementById('manualCartDropdown').classList.add('hidden');
+        }
+
+        function addSelectedItemToManualCart() {
+            if (!selectedProductForManualCart) {
+                showModal("Atención", "Selecciona un producto del buscador primero.", true);
+                return;
+            }
+            const qty = parseInt(document.getElementById('manualCartQty').value) || 1;
+            if (qty <= 0) {
+                showModal("Atención", "Ingresa una cantidad válida.", true);
+                return;
+            }
+
+            const existingIndex = currentManualOrderItems.findIndex(i => i.id === selectedProductForManualCart.id);
+            if (existingIndex >= 0) {
+                currentManualOrderItems[existingIndex].quantity += qty;
+            } else {
+                currentManualOrderItems.push({
+                    id: selectedProductForManualCart.id,
+                    name: selectedProductForManualCart.name,
+                    price: selectedProductForManualCart.price,
+                    quantity: qty
+                });
+            }
+
+            selectedProductForManualCart = null;
+            document.getElementById('manualCartSearch').value = '';
+            document.getElementById('manualCartQty').value = '1';
+            renderManualCartList();
+        }
+
+        function removeManualCartItem(id) {
+            currentManualOrderItems = currentManualOrderItems.filter(i => i.id !== id);
+            renderManualCartList();
+        }
+
+        function renderManualCartList() {
+            const container = document.getElementById('manualCartItemsList');
+            const totalInput = document.getElementById('orderTotal');
+            if (!container) return;
+
+            if (currentManualOrderItems.length === 0) {
+                container.innerHTML = '<p class="text-[11px] text-gray-400 italic">No hay productos agregados a este pedido todavía.</p>';
+                if (totalInput) totalInput.value = '0.00';
+                calculateChange();
+                return;
+            }
+
+            let grandTotal = 0;
+            container.innerHTML = currentManualOrderItems.map(item => {
+                const subtotal = item.price * item.quantity;
+                grandTotal += subtotal;
+                return `
+                    <div class="flex items-center justify-between bg-white px-3 py-2 rounded-xl border border-emerald-100 shadow-sm text-xs">
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold text-gray-800">${item.name}</span>
+                            <span class="text-gray-500">(${item.quantity} un. x S/ ${item.price.toFixed(2)})</span>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <strong class="text-emerald-700">S/ ${subtotal.toFixed(2)}</strong>
+                            <button type="button" onclick="removeManualCartItem(${item.id})" class="text-red-600 font-bold px-1.5 py-0.5 bg-red-50 rounded-md">✕</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            if (totalInput) totalInput.value = grandTotal.toFixed(2);
+            calculateChange();
+        }
+
+        // MAPA Y REPARTIDORES
+        let storeDriverMap = null; 
+        let storeDriverMarkers = {};
+
+        function initStoreDriverMap() {
+            const el = document.getElementById('storeDriverMap');
+            if (!el || typeof L === 'undefined') return;
+            if (!storeDriverMap) {
+                storeDriverMap = L.map(el, { zoomControl: true }).setView([-8.3791, -74.5539], 13);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(storeDriverMap);
+            }
+            setTimeout(() => { if (storeDriverMap) storeDriverMap.invalidateSize(); }, 150);
+            setTimeout(() => { if (storeDriverMap) storeDriverMap.invalidateSize(); }, 500);
+        }
+
+        function refreshStoreDriverMap() {
+            if (!storeDriverMap) initStoreDriverMap();
+            if (!storeDriverMap) return;
+
+            const mine = getMyStoreDrivers();
+            const validGps = mine.filter(d => {
+                const loc = d.currentLocation;
+                return loc &&
+                    Number.isFinite(Number(loc.lat)) &&
+                    Number.isFinite(Number(loc.lng));
+            });
+
+            // Eliminar marcadores de repartidores que ya no existen o no tienen GPS
+            Object.keys(storeDriverMarkers).forEach(id => {
+                const driver = validGps.find(d => String(d.id) === String(id));
+                if (!driver) {
+                    storeDriverMap.removeLayer(storeDriverMarkers[id]);
+                    delete storeDriverMarkers[id];
+                }
+            });
+
+            // Dibujar / actualizar cada repartidor en el mapa
+            validGps.forEach(d => {
+                const lat = Number(d.currentLocation.lat);
+                const lng = Number(d.currentLocation.lng);
+                const last = d.currentLocation.timestamp
+                    ? new Date(d.currentLocation.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+                    : 'Sin hora';
+
+                const icon = L.divIcon({
+                    className: '',
+                    html: `<div style="width:42px;height:42px;border-radius:50%;background:#059669;border:4px solid white;box-shadow:0 3px 12px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:white;font-size:20px;">🏍️</div>`,
+                    iconSize: [42,42],
+                    iconAnchor: [21,21],
+                    popupAnchor: [0,-20]
+                });
+
+                const popup = `<div style="min-width:190px">
+                    <div style="font-weight:800;font-size:14px;margin-bottom:5px;">🛵 ${String(d.name || 'Repartidor')}</div>
+                    <div style="font-size:12px;">Vehículo: ${String(d.vehicle || 'Moto')}</div>
+                    <div style="font-size:12px;">Estado: <b style="color:#059669">GPS activo</b></div>
+                    <div style="font-size:11px;color:#666;margin-top:4px;">Última actualización: ${last}</div>
+                    <div style="font-size:10px;color:#888;margin-top:3px;">${lat.toFixed(6)}, ${lng.toFixed(6)}</div>
+                </div>`;
+
+                if (storeDriverMarkers[d.id]) {
+                    storeDriverMarkers[d.id].setLatLng([lat, lng]);
+                    storeDriverMarkers[d.id].setIcon(icon);
+                    storeDriverMarkers[d.id].setPopupContent(popup);
+                } else {
+                    storeDriverMarkers[d.id] = L.marker([lat, lng], {icon})
+                        .addTo(storeDriverMap)
+                        .bindPopup(popup);
+                }
+            });
+
+            document.getElementById('mapOnlineCount').textContent = validGps.length;
+            document.getElementById('mapGpsCount').textContent = validGps.length;
+            document.getElementById('mapOfflineCount').textContent = mine.length - validGps.length;
+            document.getElementById('mapTotalCount').textContent = mine.length;
+
+            // Si hay repartidores con GPS, encuadrarlos automáticamente
+            if (validGps.length) {
+                const bounds = L.latLngBounds(validGps.map(d => [
+                    Number(d.currentLocation.lat),
+                    Number(d.currentLocation.lng)
+                ]));
+                if (bounds.isValid()) {
+                    storeDriverMap.fitBounds(bounds, {padding:[35,35], maxZoom:15});
+                }
+            }
+        }
+
+        // Actualización automática del mapa cada 5 segundos.
+        // El panel del repartidor debe guardar currentLocation {lat,lng,timestamp}
+        // para que esta pantalla pueda mostrar su posición.
+        if (!window.storeDriverMapRefreshTimer) {
+            window.storeDriverMapRefreshTimer = setInterval(() => {
+                if (currentLoggedStorePhone && document.getElementById('sec-tab-logistics') &&
+                    !document.getElementById('sec-tab-logistics').classList.contains('hidden')) {
+                    refreshStoreDriverMap();
+                }
+            }, 5000);
+        }
+
+        function getMyStoreDrivers() {
+            driversData = JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]');
+            return driversData.filter(d => String(d.storePhone || d.storeId || '') === String(currentLoggedStorePhone));
+        }
+
+        function openDriverForm(id = '') {
+            const form = document.getElementById('driverForm');
+            form.classList.remove('hidden');
+            document.getElementById('editingDriverId').value = '';
+            document.getElementById('driverName').value = '';
+            document.getElementById('driverPhone').value = '';
+            document.getElementById('driverDni').value = '';
+            document.getElementById('driverPin').value = '';
+            document.getElementById('driverVehicle').value = 'Moto';
+            document.getElementById('driverStatus').value = 'Activo';
+
+            if (id) {
+                const d = getMyStoreDrivers().find(x => String(x.id) === String(id));
+                if (d) {
+                    document.getElementById('editingDriverId').value = d.id;
+                    document.getElementById('driverName').value = d.name || '';
+                    document.getElementById('driverPhone').value = d.phone || '';
+                    document.getElementById('driverDni').value = d.dni || '';
+                    document.getElementById('driverPin').value = d.pin || '';
+                    document.getElementById('driverVehicle').value = d.vehicle || 'Moto';
+                    document.getElementById('driverStatus').value = d.status || 'Activo';
+                }
+            }
+            form.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function closeDriverForm() { document.getElementById('driverForm').classList.add('hidden'); }
+
+        function saveStoreDriver(e) {
+            e.preventDefault();
+            const id = document.getElementById('editingDriverId').value;
+            const driver = {
+                id: id || ('drv_' + Date.now()), 
+                storePhone: currentLoggedStorePhone,
+                name: document.getElementById('driverName').value.trim(),
+                phone: document.getElementById('driverPhone').value.trim(),
+                dni: document.getElementById('driverDni').value.trim(),
+                pin: document.getElementById('driverPin').value.trim(),
+                vehicle: document.getElementById('driverVehicle').value,
+                status: document.getElementById('driverStatus').value
+            };
+            driversData = JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]');
+            const idx = driversData.findIndex(d => String(d.id) === String(id));
+            if (idx >= 0) {
+                driversData[idx] = { ...driversData[idx], ...driver };
+            } else {
+                driversData.push(driver);
+            }
+            localStorage.setItem('astoreeco_drivers', JSON.stringify(driversData));
+            closeDriverForm(); renderStoreDrivers(); loadOrderDrivers();
+            showModal('¡Guardado!', 'Repartidor actualizado correctamente.');
+        }
+
+        function deleteStoreDriver(id) {
+            driversData = JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]').filter(d => String(d.id) !== String(id));
+            localStorage.setItem('astoreeco_drivers', JSON.stringify(driversData));
+            renderStoreDrivers(); loadOrderDrivers();
+        }
+
+        function renderStoreDrivers() {
+            const container = document.getElementById('storeDriversTableBody');
+            if (!container) return;
+            const mine = getMyStoreDrivers();
+            if (!mine.length) { container.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">No hay repartidores registrados.</p>'; return; }
+            container.innerHTML = mine.map(d => `
+                <div class="bg-gray-50 border p-3.5 rounded-2xl flex justify-between items-center text-xs">
+                    <div><strong>${d.name}</strong> (${d.vehicle}) · 📱 ${d.phone} · DNI: ${d.dni || '-'}</div>
+                    <div class="flex gap-2">
+                        <button onclick="openDriverForm('${d.id}')" class="text-blue-600 font-bold px-2.5 py-1.5 bg-blue-50 rounded-xl">Editar</button>
+                        <button onclick="deleteStoreDriver('${d.id}')" class="text-red-600 font-bold px-2.5 py-1.5 bg-red-50 rounded-xl">Eliminar</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function loadOrderDrivers() {
+            const sel = document.getElementById('orderDriverSelect');
+            if (!sel) return;
+            const mine = getMyStoreDrivers().filter(d => (d.status || 'Activo') === 'Activo');
+            sel.innerHTML = '<option value="">Selecciona un repartidor...</option>' + mine.map(d => `<option value="${d.id}" data-phone="${d.phone}">${d.name} · ${d.vehicle}</option>`).join('');
+        }
+
+        function handleOrderSubmit(e) {
+            e.preventDefault();
+            if (currentManualOrderItems.length === 0) {
+                showModal("Atención", "Agrega al menos un producto al pedido.", true);
+                return;
+            }
+
+            const totalAmount = currentManualOrderItems.reduce((acc, i) => acc + (i.price * i.quantity), 0);
+            const itemsSummary = currentManualOrderItems.map(i => `${i.quantity}x ${i.name}`).join(', ');
+            const selectedDriverId = document.getElementById('orderDriverSelect').value;
+            const drivers = JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]');
+            const foundDrv = drivers.find(d => String(d.id) === String(selectedDriverId));
+
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const fullDateStr = now.toLocaleDateString() + ' ' + timeStr;
+
+            const newOrder = {
+                id: Date.now(), 
+                storePhone: currentLoggedStorePhone,
+                clientName: document.getElementById('orderClientName').value,
+                clientPhone: document.getElementById('orderClientPhone').value,
+                address: document.getElementById('orderAddress').value,
+                items: [...currentManualOrderItems],
+                itemsDesc: itemsSummary,
+                total: totalAmount,
+                paymentMethod: document.getElementById('orderPaymentMethod').value,
+                driverId: selectedDriverId || '',
+                driverName: foundDrv ? foundDrv.name : '',
+                status: 'Pendiente', 
+                date: timeStr,
+                fullDate: fullDateStr,
+                orderType: 'manual'
+            };
+
+            ordersData = JSON.parse(localStorage.getItem('astoreeco_orders') || '[]');
+            ordersData.push(newOrder);
+            localStorage.setItem('astoreeco_orders', JSON.stringify(ordersData));
+
+            showModal('¡Emitido!', 'Pedido manual multiproducto registrado correctamente.');
+            document.getElementById('orderForm').reset();
+            currentManualOrderItems = [];
+            renderManualCartList();
+
+            if (orderDeliveryMarker && orderDeliveryMap) {
+                orderDeliveryMap.removeLayer(orderDeliveryMarker);
+                orderDeliveryMarker = null;
+            }
+            updateDashboardMetrics();
+            if(typeof window.renderClientOrders === 'function') window.renderClientOrders();
+        }
+
+        function updateOrderStatus(id, status) {
+            ordersData = JSON.parse(localStorage.getItem('astoreeco_orders') || '[]').map(o => {
+                if (String(o.id) === String(id)) o.status = status;
+                return o;
+            });
+            localStorage.setItem('astoreeco_orders', JSON.stringify(ordersData));
+            if(typeof window.renderClientOrders === 'function') window.renderClientOrders();
+        }
+
+        function updateOrderDriver(id, driverId) {
+            const drivers = JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]');
+            const drv = drivers.find(d => String(d.id) === String(driverId));
+            ordersData = JSON.parse(localStorage.getItem('astoreeco_orders') || '[]').map(o => {
+                if (String(o.id) === String(id)) {
+                    o.driverId = driverId;
+                    o.driverName = drv ? drv.name : '';
+                }
+                return o;
+            });
+            localStorage.setItem('astoreeco_orders', JSON.stringify(ordersData));
+            if(typeof window.renderClientOrders === 'function') window.renderClientOrders();
+        }
+
+        function updateDashboardMetrics() {
+            ordersData = JSON.parse(localStorage.getItem('astoreeco_orders')) || [];
+            productsData = JSON.parse(localStorage.getItem('astoreeco_products')) || [];
+            const myOrders = ordersData.filter(o => String(o.storePhone) === String(currentLoggedStorePhone));
+            const myProds = productsData.filter(p => String(p.storePhone) === String(currentLoggedStorePhone));
+            document.getElementById('dashTotalSales').innerText = `S/ ${myOrders.reduce((acc, c) => acc + c.total, 0).toFixed(2)}`;
+            document.getElementById('dashTotalOrders').innerText = myOrders.length;
+            document.getElementById('dashTotalProducts').innerText = myProds.length;
+        }
+
+        function handleProductSubmit(e) {
+            e.preventDefault();
+            const editingId = document.getElementById('editingProductId').value;
+            const product = {
+                id: editingId ? Number(editingId) : Date.now(), 
+                storePhone: currentLoggedStorePhone,
+                name: document.getElementById('prodName').value,
+                price: parseFloat(document.getElementById('prodPrice').value),
+                stock: parseInt(document.getElementById('prodStock').value) || 0,
+                unit: document.getElementById('prodUnit').value,
+                desc: document.getElementById('prodDesc').value,
+                image: document.getElementById('finalProductImageUrl').value,
+                subproducts: [...currentSubproductsList]
+            };
+
+            productsData = JSON.parse(localStorage.getItem('astoreeco_products') || '[]');
+            if (editingId) {
+                const idx = productsData.findIndex(p => Number(p.id) === Number(editingId));
+                if (idx >= 0) productsData[idx] = product;
+                showModal('¡Actualizado!', 'El producto fue modificado con éxito.');
+            } else {
+                productsData.push(product);
+                showModal('¡Registrado!', 'Producto guardado en el catálogo.');
+            }
+
+            localStorage.setItem('astoreeco_products', JSON.stringify(productsData));
+            resetProductForm(); renderStoreProducts(); updateDashboardMetrics();
+        }
+
+        function editProduct(id) {
+            const p = (JSON.parse(localStorage.getItem('astoreeco_products')) || []).find(x => Number(x.id) === Number(id));
+            if (!p) return;
+            document.getElementById('editingProductId').value = p.id;
+            document.getElementById('prodName').value = p.name;
+            document.getElementById('prodPrice').value = p.price;
+            document.getElementById('prodStock').value = p.stock;
+            document.getElementById('prodUnit').value = p.unit;
+            document.getElementById('prodDesc').value = p.desc || '';
+            document.getElementById('finalProductImageUrl').value = p.image || '';
+            currentSubproductsList = p.subproducts ? [...p.subproducts] : [];
+            renderFormSubproducts();
+
+            if (p.image) {
+                currentSelectedImageUrl = p.image;
+                const img = document.getElementById('productPreviewImg');
+                img.src = p.image; img.style.filter = 'none';
+                document.getElementById('productPreviewWrapper').classList.remove('hidden');
+            } else {
+                clearProductImage();
+            }
+
+            document.getElementById('productSubmitBtn').innerText = "Actualizar Producto";
+            document.getElementById('productCancelBtn').classList.remove('hidden');
+            switchStoreTab('products');
+            document.getElementById('productForm').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function deleteProduct(id) {
+            productsData = JSON.parse(localStorage.getItem('astoreeco_products') || '[]').filter(p => Number(p.id) !== Number(id));
+            localStorage.setItem('astoreeco_products', JSON.stringify(productsData));
+            renderStoreProducts(); updateDashboardMetrics();
+        }
+
+        function resetProductForm() {
+            document.getElementById('productForm').reset();
+            document.getElementById('editingProductId').value = '';
+            document.getElementById('productSubmitBtn').innerText = "Guardar Producto";
+            document.getElementById('productCancelBtn').classList.add('hidden');
+            currentSubproductsList = []; renderFormSubproducts(); clearProductImage();
+        }
+
+        function renderStoreProducts() {
+            productsData = JSON.parse(localStorage.getItem('astoreeco_products')) || [];
+            const container = document.getElementById('storeProductsTableBody');
+            const myProds = productsData.filter(p => String(p.storePhone) === String(currentLoggedStorePhone));
+            if (!myProds.length) { container.innerHTML = '<p class="text-xs text-gray-400 text-center py-6">No hay productos en el catálogo.</p>'; return; }
+            container.innerHTML = myProds.map(p => `
+                <div class="flex justify-between items-center bg-gray-50 p-3.5 rounded-2xl border text-xs">
+                    <div class="flex items-center gap-3">
+                        <img src="${p.image || 'https://images.unsplash.com/photo-1540420773420-3366772f4999?w=400&q=80'}" class="w-12 h-12 object-cover rounded-xl border">
+                        <div>
+                            <p class="font-bold text-gray-900">${p.name} — <span class="text-emerald-700 font-extrabold">S/ ${p.price.toFixed(2)}/${p.unit}</span> (Stock: ${p.stock})</p>
+                            <p class="text-gray-500">${p.desc || ''}</p>
+                        </div>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="editProduct(${p.id})" class="text-blue-600 font-bold px-2.5 py-1.5 bg-blue-50 rounded-xl">Editar</button>
+                        <button onclick="deleteProduct(${p.id})" class="text-red-600 font-bold px-2.5 py-1.5 bg-red-50 rounded-xl">Eliminar</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+    </script>
+
+    <script>
+    /* PEDIDOS, HORA, FILTROS Y VER RUTA CON FALLBACK SEGURO */
+    (function(){
+      function safeOrders(){ try { return JSON.parse(localStorage.getItem('astoreeco_orders') || '[]'); } catch(e){ return []; } }
+      function storeOwnsOrder(o, phone){
+        phone = String(phone||'').trim(); if(!phone) return false;
+        return String(o.storePhone||'').trim() === phone || (Array.isArray(o.items) && o.items.some(i => String(i.storePhone||'').trim() === phone));
+      }
+      function orderItemsForStore(o, phone){
+        if(!Array.isArray(o.items)) return [];
+        return o.items.filter(i => !i.storePhone || String(i.storePhone).trim() === String(phone).trim());
+      }
+      function esc(v){ return String(v??'').replace(/[&<>'"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[m])); }
+
+      window.setOrderFilter = function(filter){
+        window.currentOrderFilter = filter;
+        ['all', 'app', 'manual'].forEach(f => {
+            const btn = document.getElementById(`filterBtn-${f}`);
+            if(!btn) return;
+            btn.className = f === filter ? "text-xs px-3.5 py-2 rounded-xl font-bold bg-emerald-600 text-white transition shadow-sm" : "text-xs px-3.5 py-2 rounded-xl font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition";
+        });
+        window.renderClientOrders();
+      };
+
+      // VER RUTA EN MAPA: DESDE LA TIENDA HASTA EL CLIENTE
+      window.viewOrderRoute = async function(orderId) {
+          const orders = safeOrders();
+          const order = orders.find(o => String(o.id) === String(orderId));
+          if (!order) {
+              showModal("Aviso", "Pedido no encontrado.", true);
+              return;
+          }
+
+          switchStoreTab('logistics');
+
+          setTimeout(async () => {
+              if (typeof initStoreDriverMap === 'function') initStoreDriverMap();
+              if (!storeDriverMap) return;
+
+              // Limpiar ruta y marcadores anteriores.
+              [window.currentOrderRouteLine, window.currentDestMarker, window.currentStoreMarker].forEach(layer => {
+                  try { if (layer) storeDriverMap.removeLayer(layer); } catch(e) {}
+              });
+              window.currentOrderRouteLine = null;
+              window.currentDestMarker = null;
+              window.currentStoreMarker = null;
+
+              const store = (typeof getCurrentStoreRecord === 'function') ? getCurrentStoreRecord() : null;
+              const storeAddress = String(store?.address || document.getElementById('storePanelAddress')?.innerText || '').trim();
+              const clientAddress = String(order.deliveryAddress || order.address || '').trim();
+
+              // IMPORTANTE: el pedido del cliente guarda clientLat/clientLng.
+              // Antes se buscaban deliveryLat/deliveryLng, por eso podía terminar
+              // en una ubicación equivocada o en el centro de Pucallpa.
+              const validCoords = (lat, lng) => {
+                  const a = Number(lat), b = Number(lng);
+                  return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a) <= 90 && Math.abs(b) <= 180;
+              };
+              const coords = (obj) => {
+                  if (!obj) return null;
+                  const candidates = [
+                      [obj.clientLat, obj.clientLng],
+                      [obj.deliveryLat, obj.deliveryLng],
+                      [obj.latitude, obj.longitude],
+                      [obj.lat, obj.lng],
+                      [obj.latitude, obj.lng],
+                      [obj.lat, obj.longitude]
+                  ];
+                  for (const [lat,lng] of candidates) if (validCoords(lat,lng)) return {lat:Number(lat),lng:Number(lng)};
+                  return null;
+              };
+
+              async function geocodeExact(address) {
+                  if (!address) return null;
+                  try {
+                      // Se limita la búsqueda a Perú y se pide más de un resultado
+                      // para evitar aceptar una coincidencia genérica incorrecta.
+                      const query = encodeURIComponent(`${address}, Perú`);
+                      const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=pe&addressdetails=1&q=${query}`;
+                      const res = await fetch(url, {headers:{'Accept-Language':'es'}});
+                      const data = await res.json();
+                      if (!Array.isArray(data) || !data.length) return null;
+
+                      // Preferir resultados de dirección/edificio/casa sobre ciudades o distritos.
+                      const preferred = data.find(x => ['house','building','residential','road','retail','commercial'].includes(String(x.type||'').toLowerCase())) || data[0];
+                      const lat = parseFloat(preferred.lat), lng = parseFloat(preferred.lon);
+                      if (validCoords(lat,lng)) return {lat,lng,displayName:preferred.display_name || address};
+                  } catch(e) {}
+                  return null;
+              }
+
+              // Para la tienda: usar GPS guardado si existe; si no, geocodificar su dirección.
+              let storeCoords = coords(store);
+              if (!storeCoords) storeCoords = await geocodeExact(storeAddress);
+
+              // Para el cliente: PRIMERO las coordenadas GPS guardadas en el pedido.
+              // Esto evita que Nominatim interprete mal una dirección escrita.
+              let clientCoords = coords(order);
+              let clientLocationSource = clientCoords ? 'GPS del pedido' : '';
+              if (!clientCoords) {
+                  clientCoords = await geocodeExact(clientAddress);
+                  clientLocationSource = clientCoords ? 'Dirección geolocalizada' : '';
+              }
+
+              if (!storeCoords) {
+                  showModal("Ubicación de tienda", "No se encontró la ubicación exacta de la tienda. Registra la ubicación GPS de la tienda para trazar la ruta.", true);
+                  return;
+              }
+              if (!clientCoords) {
+                  showModal("Ruta no disponible", "No se encontró la ubicación exacta del cliente. El pedido debe conservar las coordenadas GPS del cliente o una dirección válida.", true);
+                  storeDriverMap.setView([storeCoords.lat, storeCoords.lng], 15);
+                  return;
+              }
+
+              const storeName = store?.name || document.getElementById('storePanelName')?.innerText || 'Tienda';
+
+              const storeIcon = L.divIcon({
+                  className:'',
+                  html:`<div style="width:44px;height:44px;border-radius:50%;background:#059669;border:4px solid white;box-shadow:0 3px 12px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;font-size:21px;">🏪</div>`,
+                  iconSize:[44,44],iconAnchor:[22,22],popupAnchor:[0,-22]
+              });
+              window.currentStoreMarker = L.marker([storeCoords.lat,storeCoords.lng],{icon:storeIcon})
+                  .addTo(storeDriverMap)
+                  .bindPopup(`<b>🏪 ${esc(storeName)}</b><br><small>${esc(storeAddress || 'Ubicación de la tienda')}</small>`);
+
+              const clientIcon = L.divIcon({
+                  className:'',
+                  html:`<div style="width:44px;height:44px;border-radius:50%;background:#2563eb;border:4px solid white;box-shadow:0 3px 12px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;font-size:21px;">📍</div>`,
+                  iconSize:[44,44],iconAnchor:[22,22],popupAnchor:[0,-22]
+              });
+              window.currentDestMarker = L.marker([clientCoords.lat,clientCoords.lng],{icon:clientIcon})
+                  .addTo(storeDriverMap)
+                  .bindPopup(`<b>📍 Cliente</b><br><b>Pedido:</b> #${esc(order.id)}<br><b>Cliente:</b> ${esc(order.clientName || 'Cliente')}<br><b>Dirección:</b> ${esc(clientAddress || 'Ubicación GPS')}<br><small>Ubicación: ${esc(clientLocationSource)}</small>`)
+                  .openPopup();
+
+              // Ruta real por calles: tienda → cliente.
+              try {
+                  const routeUrl = `https://router.project-osrm.org/route/v1/driving/${storeCoords.lng},${storeCoords.lat};${clientCoords.lng},${clientCoords.lat}?overview=full&geometries=geojson&steps=true`;
+                  const routeRes = await fetch(routeUrl);
+                  const routeData = await routeRes.json();
+                  const route = routeData?.routes?.[0];
+                  const geometry = route?.geometry;
+                  if (geometry?.coordinates?.length) {
+                      const latLngs = geometry.coordinates.map(c => [c[1],c[0]]);
+                      window.currentOrderRouteLine = L.polyline(latLngs,{color:'#2563eb',weight:6,opacity:.9}).addTo(storeDriverMap);
+                      const km = (Number(route.distance||0)/1000).toFixed(1);
+                      const mins = Math.max(1,Math.round(Number(route.duration||0)/60));
+                      window.currentOrderRouteLine.bindPopup(`<b>🚚 Ruta del pedido</b><br>🏪 ${esc(storeName)} → 📍 Cliente<br>📏 ${km} km · ⏱️ ${mins} min aprox.`);
+                  } else throw new Error('Sin geometría');
+              } catch(e) {
+                  window.currentOrderRouteLine = L.polyline([[storeCoords.lat,storeCoords.lng],[clientCoords.lat,clientCoords.lng]],{color:'#2563eb',weight:5,dashArray:'10 8',opacity:.75}).addTo(storeDriverMap);
+              }
+
+              const bounds = L.latLngBounds([[storeCoords.lat,storeCoords.lng],[clientCoords.lat,clientCoords.lng]]);
+              if (window.currentOrderRouteLine?.getBounds) bounds.extend(window.currentOrderRouteLine.getBounds());
+              storeDriverMap.fitBounds(bounds,{padding:[45,45],maxZoom:17});
+              storeDriverMap.invalidateSize();
+          },350);
+      };
+
+      window.renderClientOrders = function(){
+        const container = document.getElementById('clientOrdersContainer');
+        if(!container) return;
+        const phone = String(window.currentLoggedStorePhone || localStorage.getItem('astoreeco_current_store') || '').trim();
+        const allOrders = safeOrders().filter(o => storeOwnsOrder(o, phone));
+
+        const classified = allOrders.map(o => ({ ...o, calculatedType: (o.orderType === 'manual' || !Array.isArray(o.items)) ? 'manual' : 'app' }));
+        const filter = window.currentOrderFilter || 'all';
+        const orders = classified.filter(o => filter === 'all' || o.calculatedType === filter);
+
+        if(!orders.length){
+            container.innerHTML = `<div class="text-center py-8 bg-gray-50 rounded-2xl border border-dashed"><p class="text-xs text-gray-500">No hay pedidos registrados en esta sección.</p></div>`;
+            return;
+        }
+
+        const mineDrivers = (JSON.parse(localStorage.getItem('astoreeco_drivers') || '[]')).filter(d => String(d.storePhone || '') === phone && (d.status || 'Activo') === 'Activo');
+
+        container.innerHTML = orders.map(o => {
+            const items = orderItemsForStore(o, phone);
+            const total = items.length ? items.reduce((s, i) => s + Number(i.price || 0) * Number(i.quantity || 1), 0) : Number(o.total || 0);
+            const isManual = o.calculatedType === 'manual';
+            const badge = isManual ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-800">✍️ Manual</span>' : '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">📱 App</span>';
+            const orderTime = o.fullDate || o.date || 'Reciente';
+
+            let itemsDetailHtml = '';
+            if (Array.isArray(o.items)) {
+                itemsDetailHtml = `<ul class="list-disc list-inside text-gray-600 pl-1 space-y-0.5">` + 
+                    o.items.map(i => `<li>${i.quantity || 1}x ${esc(i.name)} (S/ ${((i.price||0)*(i.quantity||1)).toFixed(2)})</li>`).join('') + 
+                `</ul>`;
+            } else if (o.itemsDesc) {
+                itemsDetailHtml = `<p class="text-gray-600">${esc(o.itemsDesc)}</p>`;
+            }
+
+            const driverSelectHtml = `<select onchange="updateOrderDriver('${o.id}', this.value)" class="text-xs border rounded-xl p-1.5 font-semibold bg-gray-50">
+                <option value="">🛵 Sin repartidor asignado</option>
+                ${mineDrivers.map(d => `<option value="${d.id}" ${String(o.driverId) === String(d.id) ? 'selected' : ''}>${esc(d.name)} (${esc(d.vehicle)})</option>`).join('')}
+            </select>`;
+
+            return `<div class="bg-white border p-4 rounded-2xl shadow-sm text-xs space-y-3">
+                <div class="flex justify-between items-center">
+                    <div class="flex items-center gap-2">
+                        <span class="font-bold text-emerald-700">#${o.id}</span>
+                        <span class="text-gray-500 font-medium">🕒 ${esc(orderTime)}</span>
+                    </div>
+                    <div class="flex items-center gap-2">${badge}<span class="font-bold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">${o.status || 'Pendiente'}</span></div>
+                </div>
+                <p><b>👤 Cliente:</b> ${esc(o.clientName)} (${esc(o.clientPhone || '-')})</p>
+                <div class="bg-gray-50 p-2.5 rounded-xl border border-gray-100">
+                    <p class="font-bold text-gray-700 mb-1">📦 Productos del Pedido:</p>
+                    ${itemsDetailHtml}
+                </div>
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-2 bg-emerald-50/40 p-2.5 rounded-xl border border-emerald-100">
+                    <p><b>📍 Dirección:</b> ${esc(o.address || o.deliveryAddress)}</p>
+                    <button type="button" onclick="viewOrderRoute('${o.id}')" class="bg-blue-600 text-white font-bold px-3 py-1.5 rounded-xl hover:bg-blue-700 transition flex items-center gap-1.5 shadow-sm whitespace-nowrap">
+                        <i class="fa-solid fa-route"></i> Ver Ruta
+                    </button>
+                </div>
+                <p class="font-black text-emerald-800 text-sm">Total: S/ ${total.toFixed(2)} (${o.paymentMethod || 'Efectivo'})</p>
+                
+                <div class="pt-2 border-t flex flex-col md:flex-row justify-between items-start md:items-center gap-2">
+                    <div class="flex items-center gap-2 w-full md:w-auto">
+                        <label class="font-bold text-gray-700">Repartidor:</label>
+                        ${driverSelectHtml}
+                    </div>
+                    <div class="flex items-center gap-2 w-full md:w-auto justify-end">
+                        <label class="font-bold text-gray-700">Estado:</label>
+                        <select onchange="updateOrderStatus('${o.id}', this.value)" class="text-xs border rounded-xl p-1.5 font-semibold bg-gray-50">
+                            ${['Pendiente', 'Aceptado', 'Preparando', 'En camino', 'Entregado', 'Cancelado'].map(s => `<option value="${s}" ${o.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+                        </select>
+                    </div>
+                </div>
+            </div>`;
+        }).join('');
+      };
+    })();
+    </script>
+
+
+
+<script>
+/* ASTORE ECO SMART DELIVERY V1 */
+(function(){
+const OK='astoreeco_orders', SK='astoreeco_stores', DK='astoreeco_drivers';
+const R=k=>{try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}};
+const W=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+const N=v=>Number.isFinite(Number(v))?Number(v):null;
+function C(o){if(!o)return null;for(const p of [[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng],[o.clientLat,o.clientLng],[o.deliveryLat,o.deliveryLng]]){let a=N(p[0]),b=N(p[1]);if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b}}return null}
+function D(a,b){if(!a||!b)return Infinity;let r=6371,x=(b.lat-a.lat)*Math.PI/180,y=(b.lng-a.lng)*Math.PI/180,z=Math.sin(x/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(y/2)**2;return 2*r*Math.asin(Math.sqrt(z))}
+function build(o){
+ let stores=R(SK),groups={};
+ (Array.isArray(o.items)?o.items:[]).forEach(i=>{let k=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();(groups[k]??=[]).push(i)});
+ return Object.keys(groups).map((k,i)=>{let f=groups[k][0]||{},s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k),c=C(s);return{id:o.id+'-S'+(i+1),storeName:s?.name||f.storeName||'Tienda por confirmar',storePhone:s?.phone||f.storePhone||'',address:s?.address||f.storeAddress||'Ubicación no registrada',lat:c?.lat??null,lng:c?.lng??null,items:groups[k].map(x=>({name:x.name||x.product||'Producto',qty:Number(x.qty||x.quantity||1)})),status:'Pendiente',ready:false,pickedUp:false}});
+}
+function smart(o){if(!o?.id)return o;let stops=build(o);o.smartDelivery=o.smartDelivery||{};o.smartDelivery.version=1;o.smartDelivery.multiStore=stops.length>1;o.smartDelivery.stops=stops;o.smartDelivery.client={lat:N(o.clientLat),lng:N(o.clientLng),address:o.deliveryAddress||o.address||''};o.smartDelivery.updatedAt=new Date().toISOString();return o}
+function route(o,driver){
+ o=smart(o);let rem=(o.smartDelivery.stops||[]).map(x=>({...x})),missing=rem.filter(x=>x.lat==null||x.lng==null),valid=rem.filter(x=>x.lat!=null&&x.lng!=null),cur=C(driver)||{lat:-8.3791,lng:-74.5539},out=[];
+ while(valid.length){valid.sort((a,b)=>D(cur,{lat:a.lat,lng:a.lng})-D(cur,{lat:b.lat,lng:b.lng}));let n=valid.shift();n.distanceFromPreviousKm=+D(cur,{lat:n.lat,lng:n.lng}).toFixed(2);out.push(n);cur={lat:n.lat,lng:n.lng}}
+ let dest=C({lat:o.clientLat,lng:o.clientLng});if(dest){let prev=out.length?out[out.length-1]:cur;out.push({id:o.id+'-CLIENTE',storeName:'🏠 Cliente',address:o.smartDelivery.client.address,lat:dest.lat,lng:dest.lng,distanceFromPreviousKm:+D(prev,dest).toFixed(2),status:'Destino'});}o.smartDelivery.route=out.concat(missing);o.smartDelivery.status='Ruta calculada';return o
+}
+function save(o){let a=R(OK),i=a.findIndex(x=>String(x.id)===String(o.id));if(i>=0)a[i]=o;else a.unshift(o);W(OK,a);return o}
+function enrich(){let a=R(OK),ds=R(DK),ch=false;a.forEach(o=>{let old=JSON.stringify(o.smartDelivery),d=o.assignedDriver||ds.find(x=>x.phone===o.assignedDriver?.phone);route(o,d?.currentLocation||d);if(old!==JSON.stringify(o.smartDelivery))ch=true});if(ch)W(OK,a);return a}
+window.AstoreSmartDelivery={read:R,write:W,coords:C,distanceKm:D,smartify:smart,prepareOrder:(o,d)=>route(o,d),save,enrich,getOrder:id=>R(OK).find(o=>String(o.id)===String(id))||null,
+summary:o=>{let s=o?.smartDelivery||{},r=s.route||s.stops||[],a=r.filter(x=>x.storeName!=='🏠 Cliente'),kmTotal=r.reduce((q,x)=>q+(+x.distanceFromPreviousKm||0),0);return{stops:a,km:+kmTotal.toFixed(2),multi:!!s.multiStore}},
+stopsHTML:o=>(o?.smartDelivery?.route||o?.smartDelivery?.stops||[]).map((s,i)=>`<div class="flex gap-2 py-1.5"><span class="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-black">${s.storeName==='🏠 Cliente'?'🏠':i+1}</span><div class="min-w-0"><b class="text-[11px]">${s.storeName}</b><p class="text-[9px] text-gray-500 truncate">${s.address||''}</p><small class="text-[9px] text-emerald-700">${s.pickedUp?'Recogido':s.ready?'Listo':s.status||'Pendiente'}</small></div></div>`).join('')};
+document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>window.AstoreSmartDelivery.enrich(),150));
+})();
+</script>
+
+<script>
+(function(){
+async function render(){
+let sec=document.getElementById('sec-tab-logistics');if(!sec||document.getElementById('store-smart-card'))return;
+let b=document.createElement('div');b.id='store-smart-card';b.className='bg-white p-5 rounded-3xl shadow-sm border border-emerald-200 space-y-3 mt-4';sec.appendChild(b);
+let name=(document.getElementById('storePanelName')?.textContent||'').trim(),phone=(document.getElementById('storePanelPhone')?.textContent||'').trim();
+let a=AstoreSmartDelivery.enrich().filter(o=>o.smartDelivery?.multiStore&&(o.smartDelivery.stops||[]).some(s=>String(s.storeName).toLowerCase()===name.toLowerCase()||String(s.storePhone)===phone));
+for(const o of a){try{await AstoreEcoRoad.refreshSavedOrder(o)}catch(e){}}
+localStorage.setItem('astoreeco_orders',JSON.stringify(AstoreSmartDelivery.read('astoreeco_orders')));
+b.innerHTML='<p class="text-[10px] font-black uppercase text-emerald-700">SMART DELIVERY · CALLES REALES</p><h3 class="text-sm font-black">Mis pedidos multitienda</h3>'+(a.length?a.slice(0,8).map(o=>'<div class="border rounded-2xl p-3"><b class="text-xs text-emerald-700">'+o.id+'</b><p class="text-[10px] text-gray-600 mt-1">Esta tienda forma parte de una entrega conjunta. Marca el pedido como listo usando tu flujo actual.</p><p class="text-[10px] text-blue-700 font-bold mt-2">🚚 Delivery: S/ '+Number(o.deliveryFee||0).toFixed(2)+' · 🛣️ '+Number(o.deliveryKm||0).toFixed(2)+' km · ⏱️ '+Number(o.deliveryMinutes||0)+' min</p></div>').join(''):'<p class="text-xs text-gray-400 py-4 text-center">No hay pedidos multitienda para esta tienda.</p>');
+}
+document.addEventListener('DOMContentLoaded',()=>setTimeout(render,400));window.addEventListener('storage',e=>{if(e.key==='astoreeco_orders')setTimeout(()=>location.reload(),250)});
+})();
+</script>
+
+<script>
+/* ASTORE ECO SMART DELIVERY PRICING V2 */
+(function(){
+  const STORE_KEY='astoreeco_stores';
+  function read(k){try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}}
+  function num(v){const n=Number(v);return Number.isFinite(n)?n:null}
+  function coord(o){if(!o)return null; const pairs=[[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng]]; for(const p of pairs){const a=num(p[0]),b=num(p[1]);if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b}} return null}
+  function km(a,b){if(!a||!b)return 0;const R=6371,dLat=(b.lat-a.lat)*Math.PI/180,dLng=(b.lng-a.lng)*Math.PI/180;const q=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;return 2*R*Math.asin(Math.sqrt(q))}
+  function storesFor(items){
+    const stores=read(STORE_KEY), groups={};
+    (Array.isArray(items)?items:[]).forEach(i=>{const key=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();(groups[key]??=[]).push(i)});
+    return Object.keys(groups).map(k=>{const f=groups[k][0]||{},s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k);return {name:s?.name||f.storeName||'Tienda por confirmar',phone:s?.phone||f.storePhone||'',coord:coord(s)}});
+  }
+  function routeKm(items,client){
+    const pts=storesFor(items).map(x=>x.coord).filter(Boolean);
+    if(!pts.length)return 0;
+    let remaining=pts.slice(), cur=remaining.shift(), total=0;
+    while(remaining.length){remaining.sort((a,b)=>km(cur,a)-km(cur,b));const n=remaining.shift();total+=km(cur,n);cur=n}
+    if(client) total+=km(cur,client);
+    return total;
+  }
+  function round2(n){return Math.round(n*100)/100}
+  function calculate(items,clientLat,clientLng){
+    const client=(num(clientLat)!==null&&num(clientLng)!==null)?{lat:num(clientLat),lng:num(clientLng)}:null;
+    const stores=storesFor(items);
+    const count=stores.length;
+    if(!items?.length)return {fee:0,driverPayout:0,platformMargin:0,km:0,stores:0,extraStoreFee:0};
+    const route=routeKm(items,client);
+    let fee=route<=2?5:route<=4?6:route<=6?7:route<=8?9:10+Math.ceil(route-8)*1.5;
+    const extraStoreFee=Math.min(3,Math.max(0,count-1));
+    fee+=extraStoreFee;
+    fee=Math.max(5,Math.round(fee));
+    const driverPayout=Math.max(4,Math.round(fee*0.75));
+    const platformMargin=round2(fee-driverPayout);
+    return {fee,driverPayout,platformMargin,km:round2(route),stores:count,extraStoreFee};
+  }
+  window.AstoreEcoPricing={calculate};
+})();
+</script>
+
+<script>
+/* ASTORE ECO SMART DELIVERY V3 — RUTAS POR CALLES REALES
+   Usa OSRM para obtener distancia y recorrido sobre la red vial.
+   Si el servicio no responde, conserva el cálculo geográfico anterior como respaldo.
+*/
+(function(){
+  const STORE_KEY='astoreeco_stores', ORDERS_KEY='astoreeco_orders', DRIVERS_KEY='astoreeco_drivers';
+  const OSRM='https://router.project-osrm.org';
+
+  const read=k=>{try{return JSON.parse(localStorage.getItem(k))||[]}catch(e){return[]}};
+  const num=v=>Number.isFinite(Number(v))?Number(v):null;
+  const coord=o=>{
+    if(!o)return null;
+    for(const p of [[o.lat,o.lng],[o.latitude,o.longitude],[o.currentLocation?.lat,o.currentLocation?.lng],[o.clientLat,o.clientLng]]){
+      const a=num(p[0]),b=num(p[1]);
+      if(a!==null&&b!==null&&Math.abs(a)<=90&&Math.abs(b)<=180)return{lat:a,lng:b};
+    }
+    return null;
+  };
+  const geoKm=(a,b)=>{
+    if(!a||!b)return 0;
+    const R=6371,dLat=(b.lat-a.lat)*Math.PI/180,dLng=(b.lng-a.lng)*Math.PI/180;
+    const q=Math.sin(dLat/2)**2+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*Math.sin(dLng/2)**2;
+    return 2*R*Math.asin(Math.sqrt(q));
+  };
+  const storesFor=items=>{
+    const stores=read(STORE_KEY),groups={};
+    (Array.isArray(items)?items:[]).forEach(i=>{
+      const key=String(i.storePhone||i.storeName||i.tienda||i.store||'sin-tienda').trim().toLowerCase();
+      (groups[key]??=[]).push(i);
+    });
+    return Object.keys(groups).map(k=>{
+      const f=groups[k][0]||{};
+      const s=stores.find(x=>String(x.phone||x.name||'').trim().toLowerCase()===k);
+      return {
+        name:s?.name||f.storeName||'Tienda por confirmar',
+        phone:s?.phone||f.storePhone||'',
+        address:s?.address||f.storeAddress||'Ubicación no registrada',
+        coord:coord(s)
+      };
+    });
+  };
+
+  async function osrmTrip(points){
+    if(!points || points.length<2) return null;
+    const valid=points.filter(Boolean);
+    if(valid.length<2)return null;
+    const coords=valid.map(p=>`${p.lng},${p.lat}`).join(';');
+    const url=`${OSRM}/trip/v1/driving/${coords}?source=first&destination=last&roundtrip=false&overview=full&steps=true`;
+    const r=await fetch(url,{headers:{'Accept':'application/json'}});
+    if(!r.ok)throw new Error('OSRM '+r.status);
+    const data=await r.json();
+    if(data.code!=='Ok'||!data.trips?.[0])throw new Error('OSRM sin ruta');
+    return data;
+  }
+
+  async function roadRoute(points){
+    try{
+      const data=await osrmTrip(points);
+      const trip=data.trips[0];
+      const order=(data.waypoints||[]).map((w,i)=>({idx:i,waypoint_index:w.waypoint_index,location:w.location})).sort((a,b)=>a.waypoint_index-b.waypoint_index);
+      return {
+        ok:true,
+        km:+(trip.distance/1000).toFixed(2),
+        minutes:Math.ceil(trip.duration/60),
+        geometry:trip.geometry||null,
+        order
+      };
+    }catch(e){
+      let total=0;
+      for(let i=1;i<points.length;i++)total+=geoKm(points[i-1],points[i]);
+      return {ok:false,km:+total.toFixed(2),minutes:Math.ceil(total/0.35),geometry:null,error:String(e?.message||e)};
+    }
+  }
+
+  function feeFor(km,stores){
+    let fee=km<=2?5:km<=4?6:km<=6?7:km<=8?9:10+Math.ceil(km-8)*1.5;
+    const extra=Math.min(3,Math.max(0,(stores||1)-1));
+    fee=Math.max(5,Math.round(fee+extra));
+    const driver=Math.max(4,Math.round(fee*.75));
+    return {fee,driverPayout:driver,platformMargin:+(fee-driver).toFixed(2),extraStoreFee:extra};
+  }
+
+  async function calculateRoad(items,client,start=null){
+    const stores=storesFor(items);
+    const storePoints=stores.map(s=>s.coord).filter(Boolean);
+    let points=[];
+    if(start)points.push(start);
+    points=points.concat(storePoints);
+    if(client)points.push(client);
+    if(points.length<2){
+      const fallback=feeFor(0,stores.length);
+      return {...fallback,km:0,minutes:0,stores:stores.length,roadBased:false,reason:'Faltan coordenadas'};
+    }
+    const rr=await roadRoute(points);
+    const f=feeFor(rr.km,stores.length);
+    return {...f,km:rr.km,minutes:rr.minutes,stores:stores.length,roadBased:rr.ok,geometry:rr.geometry||null};
+  }
+
+  async function prepareOrderRoad(order,driverLocation=null){
+    if(!order?.id)return order;
+    const stores=storesFor(order.items||[]);
+    const client=coord({lat:order.clientLat,lng:order.clientLng});
+    const start=coord(driverLocation);
+    const points=[];
+    if(start)points.push(start);
+    stores.filter(s=>s.coord).forEach(s=>points.push(s.coord));
+    if(client)points.push(client);
+
+    let rr=null;
+    if(points.length>=2)rr=await roadRoute(points);
+
+    order.smartDelivery=order.smartDelivery||{};
+    order.smartDelivery.version=3;
+    order.smartDelivery.roadBased=!!rr?.ok;
+    order.smartDelivery.routeDistanceKm=rr?.km||0;
+    order.smartDelivery.etaMinutes=rr?.minutes||0;
+    order.smartDelivery.roadGeometry=rr?.geometry||null;
+    order.smartDelivery.updatedAt=new Date().toISOString();
+
+    const routeStops=stores.filter(s=>s.coord).map((s,i)=>({
+      id:order.id+'-S'+(i+1),storeName:s.name,storePhone:s.phone,address:s.address,
+      lat:s.coord.lat,lng:s.coord.lng,status:'Pendiente',ready:false,pickedUp:false
+    }));
+    if(client)routeStops.push({
+      id:order.id+'-CLIENTE',storeName:'🏠 Cliente',
+      address:order.deliveryAddress||order.address||'',lat:client.lat,lng:client.lng,status:'Destino'
+    });
+    order.smartDelivery.stops=routeStops;
+    order.smartDelivery.multiStore=stores.length>1;
+
+    const pricing=await calculateRoad(order.items||[],client,start);
+    order.deliveryFee=pricing.fee;
+    order.deliveryKm=pricing.km;
+    order.deliveryMinutes=pricing.minutes;
+    order.deliveryStoreCount=pricing.stores;
+    order.driverPayout=pricing.driverPayout;
+    order.astorEcoDeliveryMargin=pricing.platformMargin;
+    order.deliveryRoadBased=pricing.roadBased;
+    return order;
+  }
+
+  async function refreshSavedOrder(order){
+    const ds=read(DRIVERS_KEY);
+    const d=order?.assignedDriver?.phone ? ds.find(x=>String(x.phone)===String(order.assignedDriver.phone)) : null;
+    return prepareOrderRoad(order,d?.currentLocation||null);
+  }
+
+  window.AstoreEcoRoad={
+    read,coord,storesFor,geoKm,roadRoute,calculateRoad,prepareOrderRoad,refreshSavedOrder
+  };
+})();
+</script>
+
+
+<script>
+(function(){
+  const id='aeRoutingV2Badge';
+  function render(){
+    if(document.getElementById(id))return;
+    const d=document.createElement('div');d.id=id;
+    d.style.cssText='position:fixed;bottom:12px;right:12px;z-index:9999;padding:8px 11px;border-radius:999px;background:#111;color:#fff;font:600 12px system-ui;box-shadow:0 4px 16px #0003';
+    d.textContent='🧠 ASTORE ROUTING V2 · CENTRAL';
+    document.body.appendChild(d);
+  }
+  if(document.body)render();else window.addEventListener('DOMContentLoaded',render);
+})();
+</script>
+
+<script>window.addEventListener('storage',function(e){if(e.key==='astoreeco_store_features')refreshStoreFeatureAccess();});</script>
+</body>
+</html>

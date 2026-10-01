@@ -1,12 +1,21 @@
 {
-  "background_color": "#ffffff",
-  "dir": "ltr",
+  "name": "Administrador de ASTORE ECO",
+  "short_name": "ASTORE ECO",
+  "start_url": "./",
   "display": "standalone",
-  "name": "PANEL ADMIN",
-  "orientation": "any",
-  "scope": "/",
-  "short_name": "Administrador de todo",
-  "start_url": "/",
-  "theme_color": "#ffffff",
-  "description": "Ecosistema ASTORE, registro de tiendas, registro de repartidores, etc"
+  "background_color": "#ffffff",
+  "theme_color": "#10b981",
+  "description": "Ecosistema ASTORE, registro de tiendas, registro de repartidores, etc",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
 }

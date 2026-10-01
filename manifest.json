@@ -5,7 +5,8 @@
   "name": "PANEL ADMIN",
   "orientation": "any",
   "scope": "/",
-  "short_name": "astorenics-gif.github",
+  "short_name": "Administrador de todo",
   "start_url": "/",
-  "theme_color": "#ffffff"
+  "theme_color": "#ffffff",
+  "description": "Ecosistema ASTORE, registro de tiendas, registro de repartidores, etc"
 }
